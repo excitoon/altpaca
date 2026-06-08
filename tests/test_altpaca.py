@@ -59,9 +59,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("ALTPACA_CLAUDE_DIR", str(base))
     monkeypatch.setenv("ALTPACA_PROJECTS_DIR", str(projects))
     monkeypatch.setenv("ALTPACA_BACKUP_DIR", str(backups))
-    monkeypatch.setenv("ALTPACA_GROUPS_FILE", str(tmp_path / "groups.json"))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.setattr(altpaca, "_NATIVE_CACHE", None, raising=False)
     return argparse.Namespace(base=base, ccs=ccs, projects=projects, backups=backups)
 
 
@@ -173,34 +173,61 @@ def test_list_single_account(env, capsys):
     assert "total:" not in out
 
 
-def test_group_set_select_and_list(env, capsys):
-    altpaca.main(["group", "set", "work", A[:8], "--project", "proj"])
-    altpaca.main(["group", "set", "work", A[:8], "--title", "alpha"])
-    assert len(altpaca.load_groups()["work"]) == 2
+def test_snappy_decompress_literal_and_copy():
+    assert altpaca._snappy_decompress(bytes([5, 0x10]) + b"hello") == b"hello"
+    # literal "abcd" then copy(offset=4, len=4) -> "abcdabcd"
+    stream = bytes([8, 0x0C]) + b"abcd" + bytes([0x01, 0x04])
+    assert altpaca._snappy_decompress(stream) == b"abcdabcd"
 
-    capsys.readouterr()
-    altpaca.main(["group", "list"])
-    assert "work" in capsys.readouterr().out
 
-    # the group shows up as a tag in `list`
+def test_parse_dframe_groups():
+    text = json.dumps(
+        {
+            "state": {
+                "customGroups": [{"id": "cg-1", "name": "Work"}, {"id": "cg-2", "name": "Home"}],
+                "customGroupAssignments": {
+                    "code:local_aaaa": "cg-1",
+                    "code:local_bbbb": "cg-2",
+                    "code:local_cccc": "cg-missing",  # unknown group id -> dropped
+                },
+            },
+            "version": 1,
+        }
+    )
+    uuid2group, names = altpaca._parse_dframe_groups(text)
+    assert names == ["Work", "Home"]
+    assert uuid2group == {"aaaa": "Work", "bbbb": "Home"}
+
+
+def _fake_native(monkeypatch):
+    u_alpha = "11111111-1111-1111-1111-111111111111"
+    monkeypatch.setattr(altpaca, "native_groups", lambda: ({u_alpha: "Work"}, ["Work", "Home"]))
+    return u_alpha
+
+
+def test_native_group_tag_filter_and_move(env, monkeypatch, capsys):
+    _fake_native(monkeypatch)
     altpaca.main(["list", A[:8]])
-    assert "{work}" in capsys.readouterr().out
+    assert "{Work}" in capsys.readouterr().out
 
-    # and is usable as a move selector
-    altpaca.main(["move", A[:8], B[:8], "--group", "work"])
-    assert "2 session(s) to move" in capsys.readouterr().out
+    altpaca.main(["list", A[:8], "--group", "work"])  # case-insensitive
+    out = capsys.readouterr().out
+    assert "Alpha" in out and "Beta" not in out
 
-
-def test_group_unset_and_delete(env):
-    altpaca.main(["group", "set", "g1", A[:8], "--all"])
-    assert len(altpaca.load_groups()["g1"]) == 3
-    proj_uuid = next(s.uuid for s in altpaca.discover() if "proj" in s.cwd)
-    altpaca.main(["group", "unset", "g1", "--session", proj_uuid[:8]])
-    assert len(altpaca.load_groups()["g1"]) == 2
-    altpaca.main(["group", "delete", "g1"])
-    assert "g1" not in altpaca.load_groups()
+    altpaca.main(["move", A[:8], B[:8], "--group", "Work"])
+    assert "1 session(s) to move" in capsys.readouterr().out
 
 
-def test_unknown_group_errors(env):
+def test_groups_command(env, monkeypatch, capsys):
+    _fake_native(monkeypatch)
+    altpaca.main(["groups"])
+    out = capsys.readouterr().out
+    assert "Work  (1 session(s) present)" in out
+    assert "Home  (0 session(s) present)" in out
+    assert "Ungrouped: 2 session(s) present" in out
+
+
+def test_unknown_group_errors(env, monkeypatch):
+    monkeypatch.setattr(altpaca, "native_groups", lambda: ({}, ["Work"]))
     with pytest.raises(SystemExit):
         altpaca.main(["list", A[:8], "--group", "nope"])

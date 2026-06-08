@@ -73,13 +73,11 @@ altpaca dump aaaaaaaa --all                       # -> ~/.altpaca/dumps/
 altpaca dump aaaaaaaa --session 33333333 --out .  # one session, into cwd
 altpaca dump aaaaaaaa --title shopping -n          # preview filenames only
 
-# custom groups (altpaca-side labels; the app has no native grouping)
-altpaca group set work aaaaaaaa --project my-work  # tag sessions into "work"
-altpaca group list                                  # groups and their members
-altpaca list --group work                           # filter (rows show a {work} tag)
-altpaca move aaaaaaaa bbbbbbbb --group work         # move a whole group at once
-altpaca group unset work --title scratch            # untag some
-altpaca group delete work                           # drop the group
+# groups — read from the app (Work, Home, Travel, …)
+altpaca groups                                      # list the app's groups + members
+altpaca list --group Home                       # filter (rows show a {Home} tag)
+altpaca move aaaaaaaa bbbbbbbb --group Travel       # move a whole group at once
+altpaca dump aaaaaaaa --group Work            # dump a group
 
 # undo the last operation
 altpaca restore 20260608-141230 --apply
@@ -106,14 +104,20 @@ This pokes at the desktop app's private on-disk layout, which Anthropic can chan
 at any time. It is an unofficial tool — keep the backups. Set `ALTPACA_CLAUDE_DIR`
 to point at a non-default app-support location.
 
-## Custom groups
+## Groups
 
-The Claude app has no concept of session groups (sessions only carry `cwd`, `title`,
-`isArchived`, …). So "groups" are an **altpaca-side** convenience: named labels you
-assign to sessions, stored in `~/.altpaca/groups.json` and keyed by session uuid, so
-membership survives moves between accounts. Manage them with `altpaca group …` and
-select by them anywhere with `--group NAME`. "Projects" need no setup — they're just
-the session `cwd`, selectable with `--project`.
+The desktop app's sidebar groups (Work, Home, Travel, …) are stored in its
+**Local Storage** (a Chromium leveldb) under the `dframe-store` key — a group list plus
+a `session → group` map. altpaca reads them **read-only** via a small built-in
+leveldb/Snappy parser (no external deps); it never writes them back.
+
+- `altpaca groups` lists them with their members.
+- `--group NAME` selects a group anywhere (`list`/`move`/`copy`/`dump`), case-insensitive.
+
+Moving a session between accounts is keyed by session id, so its group membership is
+unaffected. For the freshest read, quit the app first (recent group edits can sit in the
+leveldb write-ahead log until it flushes). "Projects" are just the session `cwd` —
+select with `--project`, no setup needed.
 
 ## Environment
 
@@ -121,7 +125,6 @@ the session `cwd`, selectable with `--project`.
 - `CLAUDE_CONFIG_DIR` — if set, transcripts are read from `$CLAUDE_CONFIG_DIR/projects` (matches Claude Code).
 - `ALTPACA_PROJECTS_DIR` — override the transcripts dir directly (wins over the above).
 - `ALTPACA_BACKUP_DIR` — where backups are written (default `~/.altpaca/backups`).
-- `ALTPACA_GROUPS_FILE` — custom-groups store (default `~/.altpaca/groups.json`).
 
 ## License
 

@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -64,26 +65,257 @@ def backup_root() -> Path:
     return Path(os.environ.get("ALTPACA_BACKUP_DIR", str(HOME / ".altpaca" / "backups")))
 
 
-def groups_file() -> Path:
-    return Path(os.environ.get("ALTPACA_GROUPS_FILE", str(HOME / ".altpaca" / "groups.json")))
+# --------------------------------------------------------------------------- #
+# native groups (READ-ONLY). The desktop app keeps custom groups in its
+# Local Storage leveldb, under key "dframe-store", as JSON:
+#   {"customGroups":[{"id","name"}],
+#    "customGroupAssignments":{"code:local_<uuid>":"<group-id>"}}
+# We read it with a tiny pure-Python leveldb (SSTable + WAL + Snappy) reader.
+# Nothing is ever written back.
+# --------------------------------------------------------------------------- #
+def local_storage_dir() -> Path:
+    return base_dir() / "Local Storage" / "leveldb"
 
 
-def load_groups() -> dict:
-    # custom groups are an altpaca concept (the app has none): {name: [session-uuid, ...]}
-    f = groups_file()
-    if f.exists():
+def _uvarint(b, p):
+    shift = result = 0
+    while True:
+        c = b[p]
+        p += 1
+        result |= (c & 0x7F) << shift
+        if not c & 0x80:
+            return result, p
+        shift += 7
+
+
+def _snappy_decompress(data: bytes) -> bytes:
+    _, p = _uvarint(data, 0)  # uncompressed-length preamble
+    out = bytearray()
+    n = len(data)
+    while p < n:
+        tag = data[p]
+        p += 1
+        t = tag & 3
+        if t == 0:
+            ln = tag >> 2
+            if ln >= 60:
+                nb = ln - 59
+                ln = int.from_bytes(data[p : p + nb], "little")
+                p += nb
+            ln += 1
+            out += data[p : p + ln]
+            p += ln
+        else:
+            if t == 1:
+                length = ((tag >> 2) & 7) + 4
+                offset = ((tag >> 5) << 8) | data[p]
+                p += 1
+            elif t == 2:
+                length = (tag >> 2) + 1
+                offset = int.from_bytes(data[p : p + 2], "little")
+                p += 2
+            else:
+                length = (tag >> 2) + 1
+                offset = int.from_bytes(data[p : p + 4], "little")
+                p += 4
+            start = len(out) - offset
+            for i in range(length):
+                out.append(out[start + i])
+    return bytes(out)
+
+
+def _ldb_block(f, offset, size):
+    f.seek(offset)
+    raw = f.read(size)
+    ctype = f.read(5)[:1]  # 1 byte compression type + 4 byte crc
+    return _snappy_decompress(raw) if ctype == b"\x01" else raw
+
+
+def _ldb_block_kvs(block):
+    n = len(block)
+    num_restarts = int.from_bytes(block[n - 4 : n], "little")
+    end = n - 4 * (num_restarts + 1)
+    p = 0
+    prev = b""
+    out = []
+    while p < end:
+        shared, p = _uvarint(block, p)
+        nonshared, p = _uvarint(block, p)
+        vlen, p = _uvarint(block, p)
+        key = prev[:shared] + block[p : p + nonshared]
+        p += nonshared
+        out.append((key, block[p : p + vlen]))
+        p += vlen
+        prev = key
+    return out
+
+
+def _sstable_entries(path):
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        fsize = f.tell()
+        f.seek(fsize - 48)  # footer
+        footer = f.read(48)
+        p = 0
+        _, p = _uvarint(footer, p)  # metaindex handle
+        _, p = _uvarint(footer, p)
+        idx_off, p = _uvarint(footer, p)
+        idx_size, p = _uvarint(footer, p)
+        for _k, val in _ldb_block_kvs(_ldb_block(f, idx_off, idx_size)):
+            q = 0
+            boff, q = _uvarint(val, q)
+            bsize, q = _uvarint(val, q)
+            try:
+                block = _ldb_block(f, boff, bsize)
+            except Exception:
+                continue
+            yield from _ldb_block_kvs(block)
+
+
+def _wal_entries(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    recs = []
+    frag = b""
+    off = 0
+    while off < len(data):
+        block = data[off : off + 32768]
+        off += 32768
+        bp = 0
+        while bp + 7 <= len(block):
+            length = int.from_bytes(block[bp + 4 : bp + 6], "little")
+            rtype = block[bp + 6]
+            if length == 0 and rtype == 0:
+                break
+            payload = block[bp + 7 : bp + 7 + length]
+            bp += 7 + length
+            if rtype == 1:
+                recs.append(payload)
+            elif rtype == 2:
+                frag = payload
+            elif rtype == 3:
+                frag += payload
+            elif rtype == 4:
+                recs.append(frag + payload)
+                frag = b""
+    for rec in recs:
+        if len(rec) < 12:
+            continue
+        seq = int.from_bytes(rec[0:8], "little")
+        count = int.from_bytes(rec[8:12], "little")
+        p = 12
+        for i in range(count):
+            if p >= len(rec):
+                break
+            tag = rec[p]
+            p += 1
+            klen, p = _uvarint(rec, p)
+            key = rec[p : p + klen]
+            p += klen
+            if tag == 1:
+                vlen, p = _uvarint(rec, p)
+                yield key, seq + i, 1, rec[p : p + vlen]
+                p += vlen
+            elif tag == 0:
+                yield key, seq + i, 0, None
+            else:
+                break
+
+
+def _split_internal(key):
+    if len(key) < 8:
+        return key, 0, 1
+    trailer = int.from_bytes(key[-8:], "little")
+    return key[:-8], trailer >> 8, trailer & 0xFF
+
+
+def _decode_ls_value(v: bytes) -> str:
+    if not v:
+        return ""
+    if v[0] == 0:
+        return v[1:].decode("utf-16-le", "replace")
+    if v[0] == 1:
+        return v[1:].decode("latin-1", "replace")
+    return v.decode("utf-8", "replace")
+
+
+def _read_localstorage_blob(needle: str):
+    """Newest decoded localStorage value containing `needle`, or None."""
+    src = local_storage_dir()
+    if not src.exists():
+        return None
+    tmp = Path(tempfile.mkdtemp(prefix="altpaca-ls-"))
+    try:
+        for f in src.glob("*"):
+            try:
+                shutil.copy(f, tmp)  # snapshot; the live DB may be locked/mid-write
+            except Exception:
+                pass
+        merged = {}
+        for ldb in sorted(tmp.glob("*.ldb")):
+            try:
+                for k, v in _sstable_entries(ldb):
+                    uk, seq, typ = _split_internal(k)
+                    cur = merged.get(uk)
+                    if cur is None or seq > cur[0]:
+                        merged[uk] = (seq, None if typ == 0 else v)
+            except Exception:
+                pass
+        for log in sorted(tmp.glob("*.log")):
+            try:
+                for uk, seq, typ, v in _wal_entries(log):
+                    cur = merged.get(uk)
+                    if cur is None or seq > cur[0]:
+                        merged[uk] = (seq, None if typ == 0 else v)
+            except Exception:
+                pass
+        best = None
+        for _uk, (seq, v) in merged.items():
+            if v is not None:
+                text = _decode_ls_value(v)
+                if needle in text and (best is None or seq > best[0]):
+                    best = (seq, text)
+        return best[1] if best else None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _parse_dframe_groups(text: str):
+    store = json.loads(text)
+    state = store.get("state", store)
+    id2name = {g["id"]: g["name"] for g in state.get("customGroups", [])}
+    names = [g["name"] for g in state.get("customGroups", [])]
+    uuid2group = {}
+    for key, gid in state.get("customGroupAssignments", {}).items():
+        uuid = key.split("local_", 1)[-1] if "local_" in key else key.rsplit(":", 1)[-1]
+        name = id2name.get(gid)
+        if name:
+            uuid2group[uuid] = name
+    return uuid2group, names
+
+
+_NATIVE_CACHE = None
+
+
+def native_groups():
+    """(uuid -> group name, ordered group names) from the app's Local Storage."""
+    global _NATIVE_CACHE
+    if _NATIVE_CACHE is None:
+        text = _read_localstorage_blob('"customGroups"')
         try:
-            return json.loads(f.read_text())
+            _NATIVE_CACHE = _parse_dframe_groups(text) if text else ({}, [])
         except Exception:
-            return {}
-    return {}
+            _NATIVE_CACHE = ({}, [])
+    return _NATIVE_CACHE
 
 
-def save_groups(groups: dict):
-    f = groups_file()
-    f.parent.mkdir(parents=True, exist_ok=True)
-    cleaned = {name: sorted(set(members)) for name, members in groups.items() if members}
-    f.write_text(json.dumps(cleaned, indent=2))
+def match_group_name(query, names):
+    for n in names:
+        if n.lower() == query.lower():
+            return n
+    if not names:
+        die("could not read the app's groups (Local Storage not found or unreadable)")
+    die(f"no such group '{query}'. groups: " + ", ".join(names))
 
 
 def die(msg: str, code: int = 1):
@@ -254,11 +486,9 @@ def select(sessions: list, args) -> list:
         t = args.title.lower()
         out = [s for s in out if t in s.title.lower()]
     if getattr(args, "group", None):
-        g = load_groups()
-        if args.group not in g:
-            die(f"no such group '{args.group}' (see: altpaca group list)")
-        members = set(g[args.group])
-        out = [s for s in out if s.uuid in members]
+        uuid2group, names = native_groups()
+        target = match_group_name(args.group, names)
+        out = [s for s in out if uuid2group.get(s.uuid) == target]
     if getattr(args, "skip_archived", False):
         out = [s for s in out if not s.archived]
     return out
@@ -276,7 +506,7 @@ def has_positive_selector(args) -> bool:
 # --------------------------------------------------------------------------- #
 # printing
 # --------------------------------------------------------------------------- #
-def print_session_rows(sessions: list, groups: dict = None):
+def print_session_rows(sessions: list, uuid2group: dict = None):
     for s in sorted(sessions, key=lambda x: x.last_activity, reverse=True):
         base = os.path.basename(s.cwd.rstrip("/")) or s.cwd or "?"
         flag = "A" if s.archived else " "
@@ -284,11 +514,8 @@ def print_session_rows(sessions: list, groups: dict = None):
         title = s.title.replace("\n", " ")
         if len(title) > 46:
             title = title[:45] + "…"
-        tag = ""
-        if groups:
-            names = [n for n, members in groups.items() if s.uuid in members]
-            if names:
-                tag = "  {" + ",".join(names) + "}"
+        gname = uuid2group.get(s.uuid) if uuid2group else None
+        tag = f"  {{{gname}}}" if gname else ""
         row = f"  {s.uuid[:8]}  {fmt_ts(s.created)}  {fmt_ts(s.last_activity)}  {flag}  {base[:18]:18}  {title}"
         print(f"{row}{miss}{tag}")
 
@@ -323,7 +550,7 @@ def cmd_accounts(args):
 
 def cmd_list(args):
     sessions = discover()
-    groups = load_groups()
+    uuid2group, _names = native_groups()
     accounts = [resolve_account(args.account)] if args.account else all_accounts()
     if not accounts:
         print("no accounts found.")
@@ -339,7 +566,7 @@ def cmd_list(args):
             print()
         print(f"account {acc}  ({len(ss)} session(s)){mark}")
         print(f"  {'uuid':8}  {'first activity':16}  {'last activity':16}  {'':1}  {'project':18}  title")
-        print_session_rows(ss, groups=groups)
+        print_session_rows(ss, uuid2group=uuid2group)
         total += len(ss)
     if not args.account and len(accounts) > 1:
         print(f"\ntotal: {total} session(s) across {len(accounts)} account(s)")
@@ -603,65 +830,25 @@ def cmd_doctor(args):
             print(f"  {a}  workspaces={len(workspaces_of(a))}")
 
 
-def _group_select(args) -> list:
-    sessions = discover()
-    if args.account:
-        acc = resolve_account(args.account)
-        sessions = [s for s in sessions if s.account == acc]
-    if has_positive_selector(args) or args.all:
-        return select(sessions, args)
-    die("specify which sessions: --all or a selector (--session/--project/--title/--group)")
-
-
-def cmd_group_list(args):
-    groups = load_groups()
-    if not groups:
-        print("no groups yet. create one, e.g.:  altpaca group set work aaaaaaaa --project my-work")
+def cmd_groups(args):
+    uuid2group, names = native_groups()
+    if not names:
+        print("no app groups found (could not read Local Storage, or none defined).")
         return
     index = {s.uuid: s for s in discover()}
-    for name in sorted(groups):
-        members = groups[name]
-        present = [index[u] for u in members if u in index]
-        print(f"{name}  ({len(present)} session(s))")
+    members = {n: [] for n in names}
+    for uuid, gname in uuid2group.items():
+        if uuid in index:
+            members.setdefault(gname, []).append(index[uuid])
+    for name in names:
+        present = members.get(name, [])
+        print(f"{name}  ({len(present)} session(s) present)")
         for s in sorted(present, key=lambda x: x.last_activity, reverse=True):
             base = os.path.basename(s.cwd.rstrip("/")) or s.cwd or "?"
             print(f"  {s.uuid[:8]}  {base[:18]:18}  {s.title[:50]}")
-        stale = len(members) - len(present)
-        if stale:
-            print(f"  ({stale} member(s) not currently present)")
-
-
-def cmd_group_set(args):
-    chosen = _group_select(args)
-    if not chosen:
-        die("no matching sessions")
-    groups = load_groups()
-    members = set(groups.get(args.name, []))
-    before = len(members)
-    members |= {s.uuid for s in chosen}
-    groups[args.name] = sorted(members)
-    save_groups(groups)
-    print(f"group '{args.name}': {len(members)} member(s) (+{len(members) - before})")
-
-
-def cmd_group_unset(args):
-    chosen = _group_select(args)
-    groups = load_groups()
-    if args.name not in groups:
-        die(f"no such group '{args.name}'")
-    members = set(groups[args.name]) - {s.uuid for s in chosen}
-    groups[args.name] = sorted(members)
-    save_groups(groups)
-    print(f"group '{args.name}': {len(members)} member(s)")
-
-
-def cmd_group_delete(args):
-    groups = load_groups()
-    if args.name not in groups:
-        die(f"no such group '{args.name}'")
-    del groups[args.name]
-    save_groups(groups)
-    print(f"deleted group '{args.name}'")
+    ungrouped = [s for s in index.values() if s.uuid not in uuid2group]
+    if ungrouped:
+        print(f"\nUngrouped: {len(ungrouped)} session(s) present")
 
 
 # --------------------------------------------------------------------------- #
@@ -672,7 +859,7 @@ def add_selectors(sp):
     sp.add_argument("--session", nargs="+", metavar="ID", help="select by session/cli uuid (prefix ok)")
     sp.add_argument("--project", metavar="PATH", help="select sessions whose cwd contains PATH")
     sp.add_argument("--title", metavar="SUBSTR", help="select sessions whose title contains SUBSTR (case-insensitive)")
-    sp.add_argument("--group", metavar="NAME", help="select sessions in a custom group (see: altpaca group)")
+    sp.add_argument("--group", metavar="NAME", help="select sessions in an app group (see: altpaca groups)")
     sp.add_argument("--skip-archived", action="store_true", help="exclude archived sessions")
 
 
@@ -698,23 +885,8 @@ def build_parser():
     sp.add_argument("-n", "--dry-run", action="store_true", help="show filenames without writing")
     sp.set_defaults(func=cmd_dump)
 
-    gp = sub.add_parser("group", help="manage custom groups (altpaca-side labels for sessions)")
-    gsub = gp.add_subparsers(dest="group_cmd", required=True)
-    g = gsub.add_parser("list", help="list groups and their members")
-    g.set_defaults(func=cmd_group_list)
-    g = gsub.add_parser("set", help="add sessions to a group (creates it if new)")
-    g.add_argument("name")
-    g.add_argument("account", nargs="?", help="limit to one account (prefix ok)")
-    add_selectors(g)
-    g.set_defaults(func=cmd_group_set)
-    g = gsub.add_parser("unset", help="remove sessions from a group")
-    g.add_argument("name")
-    g.add_argument("account", nargs="?", help="limit to one account (prefix ok)")
-    add_selectors(g)
-    g.set_defaults(func=cmd_group_unset)
-    g = gsub.add_parser("delete", help="delete a group entirely")
-    g.add_argument("name")
-    g.set_defaults(func=cmd_group_delete)
+    sp = sub.add_parser("groups", help="list the app's custom groups and their members (read-only)")
+    sp.set_defaults(func=cmd_groups)
 
     for name, helptext, remove in (
         ("move", "move sessions to another account (removes from source)", True),
