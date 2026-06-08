@@ -26,6 +26,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -291,6 +292,71 @@ def cmd_list(args):
     print_session_rows(ss)
 
 
+def _slug(text: str, n: int = 40) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", text or "").strip("-").lower()
+    return s[:n] or "session"
+
+
+def _dump_name(s: Session) -> str:
+    when = datetime.fromtimestamp(s.created / 1000).strftime("%Y%m%d-%H%M%S") if s.created else "00000000-000000"
+    return f"{when}_{s.uuid[:8]}_{_slug(s.title)}.altpaca.json"
+
+
+def _read_transcript(path: Path) -> list:
+    out = []
+    for line in Path(path).read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            out.append({"_raw": line})
+    return out
+
+
+def cmd_dump(args):
+    acc = resolve_account(args.account)
+    ss = [s for s in discover() if s.account == acc]
+    if has_positive_selector(args) or args.all:
+        ss = select(ss, args)
+    else:
+        die("refusing to dump everything implicitly — pass --all or a selector (--session/--project/--title)")
+    if not ss:
+        die("no matching sessions")
+
+    out_dir = Path(args.out).expanduser() if args.out else (HOME / ".altpaca" / "dumps")
+    print(f"dumping {len(ss)} session(s) from {acc[:8]} -> {out_dir}")
+    if args.dry_run:
+        for s in ss:
+            print(f"  would write {_dump_name(s)}")
+        print("\n(dry-run) re-run without -n to write the files.")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for s in ss:
+        tpath = s.transcript()
+        bundle = {
+            "altpaca_dump": 1,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "source_account": acc,
+            "source_workspace": s.workspace,
+            "session_file": s.path.name,
+            "metadata": s.meta,
+            "cwd": s.cwd,
+            "cli_session_id": s.cli_id,
+            "transcript_file": str(tpath) if tpath else None,
+            "transcript": _read_transcript(tpath) if tpath else None,
+        }
+        dest = out_dir / _dump_name(s)
+        dest.write_text(json.dumps(bundle, indent=2, ensure_ascii=False))
+        written += 1
+        tag = "" if tpath else "  (no transcript)"
+        print(f"  {dest.name}  ({dest.stat().st_size} bytes){tag}")
+    print(f"\nwrote {written} file(s) to {out_dir}")
+
+
 def make_backup(originals: list, dests: list) -> Path:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     bdir = backup_root() / ts
@@ -509,6 +575,13 @@ def build_parser():
     sp.add_argument("account", help="account uuid (prefix ok)")
     add_selectors(sp)
     sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("dump", help="export sessions to portable auto-named JSON files (metadata + transcript)")
+    sp.add_argument("account", help="account uuid (prefix ok)")
+    add_selectors(sp)
+    sp.add_argument("--out", metavar="DIR", help="output directory (default ~/.altpaca/dumps)")
+    sp.add_argument("-n", "--dry-run", action="store_true", help="show filenames without writing")
+    sp.set_defaults(func=cmd_dump)
 
     for name, helptext, remove in (
         ("move", "move sessions to another account (removes from source)", True),

@@ -138,3 +138,21 @@ def test_copy_keeps_source(env):
 def test_move_requires_selection(env):
     with pytest.raises(SystemExit):
         altpaca.main(["move", A[:8], B[:8]])  # no --all / selector
+
+
+def test_dump_writes_bundles(env, tmp_path):
+    out = tmp_path / "dumps"
+    altpaca.main(["dump", A[:8], "--all", "--out", str(out)])
+    files = sorted(out.glob("*.altpaca.json"))
+    assert len(files) == 3
+    bundle = json.loads(files[0].read_text())
+    assert bundle["altpaca_dump"] == 1
+    assert bundle["metadata"]["cliSessionId"]
+    assert bundle["transcript"] is not None  # transcript embedded
+
+
+def test_dump_dry_run_writes_nothing(env, tmp_path, capsys):
+    out = tmp_path / "dumps2"
+    altpaca.main(["dump", A[:8], "--project", "proj", "--out", str(out), "-n"])
+    assert not out.exists() or not list(out.glob("*.json"))
+    assert "dry-run" in capsys.readouterr().out
