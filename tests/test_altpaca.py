@@ -159,6 +159,17 @@ def test_dump_dry_run_writes_nothing(env, tmp_path, capsys):
     assert "dry-run" in capsys.readouterr().out
 
 
+def test_dump_handles_lone_surrogate(env, tmp_path):
+    # corrupt Alpha's transcript with a lone surrogate (half an emoji)
+    cli = "c1111111-1111-1111-1111-111111111111"
+    (env.projects / "encoded" / f"{cli}.jsonl").write_text('{"text": "\\ud83d"}\n')
+    out = tmp_path / "dumps3"
+    altpaca.main(["dump", A[:8], "--session", "11111111", "--out", str(out)])
+    files = list(out.glob("*.altpaca.json"))
+    assert len(files) == 1
+    assert "altpaca_dump" in files[0].read_bytes().decode("utf-8")  # valid UTF-8, no crash
+
+
 def test_list_all_accounts(env, capsys):
     altpaca.main(["list"])  # no account -> every account
     out = capsys.readouterr().out

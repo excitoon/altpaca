@@ -623,7 +623,7 @@ def cmd_dump(args):
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    written = 0
+    written = failed = 0
     for s in ss:
         tpath = s.transcript()
         bundle = {
@@ -639,11 +639,19 @@ def cmd_dump(args):
             "transcript": _read_transcript(tpath) if tpath else None,
         }
         dest = out_dir / _dump_name(s)
-        dest.write_text(json.dumps(bundle, indent=2, ensure_ascii=False))
+        try:
+            data = json.dumps(bundle, indent=2, ensure_ascii=False)
+            # tolerate lone surrogates (broken emoji halves) in transcripts
+            dest.write_bytes(data.encode("utf-8", "replace"))
+        except Exception as e:
+            failed += 1
+            warn(f"could not dump {s.uuid[:8]}: {e}")
+            continue
         written += 1
         tag = "" if tpath else "  (no transcript)"
         print(f"  {dest.name}  ({dest.stat().st_size} bytes){tag}")
-    print(f"\nwrote {written} file(s) to {out_dir}")
+    suffix = f" ({failed} failed)" if failed else ""
+    print(f"\nwrote {written} file(s) to {out_dir}{suffix}")
 
 
 def make_backup(originals: list, dests: list) -> Path:
