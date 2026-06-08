@@ -75,7 +75,7 @@ altpaca dump aaaaaaaa --title shopping -n          # preview filenames only
 
 # groups — read from the app (Work, Home, Travel, …)
 altpaca groups                                      # list the app's groups + members
-altpaca list --group Home                       # filter (rows show a {Home} tag)
+altpaca list --group Home                       # filter (group shown as a column)
 altpaca move aaaaaaaa bbbbbbbb --group Travel       # move a whole group at once
 altpaca dump aaaaaaaa --group Work            # dump a group
 

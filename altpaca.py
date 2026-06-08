@@ -507,6 +507,7 @@ def has_positive_selector(args) -> bool:
 # printing
 # --------------------------------------------------------------------------- #
 def print_session_rows(sessions: list, uuid2group: dict = None):
+    show_group = uuid2group is not None
     for s in sorted(sessions, key=lambda x: x.last_activity, reverse=True):
         base = os.path.basename(s.cwd.rstrip("/")) or s.cwd or "?"
         flag = "A" if s.archived else " "
@@ -514,10 +515,12 @@ def print_session_rows(sessions: list, uuid2group: dict = None):
         title = s.title.replace("\n", " ")
         if len(title) > 46:
             title = title[:45] + "…"
-        gname = uuid2group.get(s.uuid) if uuid2group else None
-        tag = f"  {{{gname}}}" if gname else ""
-        row = f"  {s.uuid[:8]}  {fmt_ts(s.created)}  {fmt_ts(s.last_activity)}  {flag}  {base[:18]:18}  {title}"
-        print(f"{row}{miss}{tag}")
+        cells = [f"{s.uuid[:8]:8}", f"{fmt_ts(s.created):16}", f"{fmt_ts(s.last_activity):16}", flag]
+        if show_group:
+            cells.append(f"{(uuid2group.get(s.uuid) or '')[:12]:12}")
+        cells.append(f"{base[:18]:18}")
+        cells.append(title)
+        print("  " + "  ".join(cells) + miss)
 
 
 # --------------------------------------------------------------------------- #
@@ -551,6 +554,7 @@ def cmd_accounts(args):
 def cmd_list(args):
     sessions = discover()
     uuid2group, _names = native_groups()
+    show_group = bool(uuid2group)
     accounts = [resolve_account(args.account)] if args.account else all_accounts()
     if not accounts:
         print("no accounts found.")
@@ -565,8 +569,13 @@ def cmd_list(args):
         if i:
             print()
         print(f"account {acc}  ({len(ss)} session(s)){mark}")
-        print(f"  {'uuid':8}  {'first activity':16}  {'last activity':16}  {'':1}  {'project':18}  title")
-        print_session_rows(ss, uuid2group=uuid2group)
+        hdr = [f"{'uuid':8}", f"{'first activity':16}", f"{'last activity':16}", " "]
+        if show_group:
+            hdr.append(f"{'group':12}")
+        hdr.append(f"{'project':18}")
+        hdr.append("title")
+        print("  " + "  ".join(hdr))
+        print_session_rows(ss, uuid2group=uuid2group if show_group else None)
         total += len(ss)
     if not args.account and len(accounts) > 1:
         print(f"\ntotal: {total} session(s) across {len(accounts)} account(s)")

@@ -208,7 +208,7 @@ def _fake_native(monkeypatch):
 def test_native_group_tag_filter_and_move(env, monkeypatch, capsys):
     _fake_native(monkeypatch)
     altpaca.main(["list", A[:8]])
-    assert "{Work}" in capsys.readouterr().out
+    assert "Work" in capsys.readouterr().out  # shown in the group column
 
     altpaca.main(["list", A[:8], "--group", "work"])  # case-insensitive
     out = capsys.readouterr().out
