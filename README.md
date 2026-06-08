@@ -73,6 +73,14 @@ altpaca dump aaaaaaaa --all                       # -> ~/.altpaca/dumps/
 altpaca dump aaaaaaaa --session 33333333 --out .  # one session, into cwd
 altpaca dump aaaaaaaa --title shopping -n          # preview filenames only
 
+# custom groups (altpaca-side labels; the app has no native grouping)
+altpaca group set work aaaaaaaa --project my-work  # tag sessions into "work"
+altpaca group list                                  # groups and their members
+altpaca list --group work                           # filter (rows show a {work} tag)
+altpaca move aaaaaaaa bbbbbbbb --group work         # move a whole group at once
+altpaca group unset work --title scratch            # untag some
+altpaca group delete work                           # drop the group
+
 # undo the last operation
 altpaca restore 20260608-141230 --apply
 
@@ -98,12 +106,22 @@ This pokes at the desktop app's private on-disk layout, which Anthropic can chan
 at any time. It is an unofficial tool — keep the backups. Set `ALTPACA_CLAUDE_DIR`
 to point at a non-default app-support location.
 
+## Custom groups
+
+The Claude app has no concept of session groups (sessions only carry `cwd`, `title`,
+`isArchived`, …). So "groups" are an **altpaca-side** convenience: named labels you
+assign to sessions, stored in `~/.altpaca/groups.json` and keyed by session uuid, so
+membership survives moves between accounts. Manage them with `altpaca group …` and
+select by them anywhere with `--group NAME`. "Projects" need no setup — they're just
+the session `cwd`, selectable with `--project`.
+
 ## Environment
 
 - `ALTPACA_CLAUDE_DIR` — Claude app-support dir (default `~/Library/Application Support/Claude`).
 - `CLAUDE_CONFIG_DIR` — if set, transcripts are read from `$CLAUDE_CONFIG_DIR/projects` (matches Claude Code).
 - `ALTPACA_PROJECTS_DIR` — override the transcripts dir directly (wins over the above).
 - `ALTPACA_BACKUP_DIR` — where backups are written (default `~/.altpaca/backups`).
+- `ALTPACA_GROUPS_FILE` — custom-groups store (default `~/.altpaca/groups.json`).
 
 ## License
 

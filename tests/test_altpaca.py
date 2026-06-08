@@ -59,6 +59,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("ALTPACA_CLAUDE_DIR", str(base))
     monkeypatch.setenv("ALTPACA_PROJECTS_DIR", str(projects))
     monkeypatch.setenv("ALTPACA_BACKUP_DIR", str(backups))
+    monkeypatch.setenv("ALTPACA_GROUPS_FILE", str(tmp_path / "groups.json"))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     return argparse.Namespace(base=base, ccs=ccs, projects=projects, backups=backups)
@@ -170,3 +171,36 @@ def test_list_single_account(env, capsys):
     out = capsys.readouterr().out
     assert A in out and B not in out  # only the requested account
     assert "total:" not in out
+
+
+def test_group_set_select_and_list(env, capsys):
+    altpaca.main(["group", "set", "work", A[:8], "--project", "proj"])
+    altpaca.main(["group", "set", "work", A[:8], "--title", "alpha"])
+    assert len(altpaca.load_groups()["work"]) == 2
+
+    capsys.readouterr()
+    altpaca.main(["group", "list"])
+    assert "work" in capsys.readouterr().out
+
+    # the group shows up as a tag in `list`
+    altpaca.main(["list", A[:8]])
+    assert "{work}" in capsys.readouterr().out
+
+    # and is usable as a move selector
+    altpaca.main(["move", A[:8], B[:8], "--group", "work"])
+    assert "2 session(s) to move" in capsys.readouterr().out
+
+
+def test_group_unset_and_delete(env):
+    altpaca.main(["group", "set", "g1", A[:8], "--all"])
+    assert len(altpaca.load_groups()["g1"]) == 3
+    proj_uuid = next(s.uuid for s in altpaca.discover() if "proj" in s.cwd)
+    altpaca.main(["group", "unset", "g1", "--session", proj_uuid[:8]])
+    assert len(altpaca.load_groups()["g1"]) == 2
+    altpaca.main(["group", "delete", "g1"])
+    assert "g1" not in altpaca.load_groups()
+
+
+def test_unknown_group_errors(env):
+    with pytest.raises(SystemExit):
+        altpaca.main(["list", A[:8], "--group", "nope"])

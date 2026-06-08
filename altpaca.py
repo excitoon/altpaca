@@ -64,6 +64,28 @@ def backup_root() -> Path:
     return Path(os.environ.get("ALTPACA_BACKUP_DIR", str(HOME / ".altpaca" / "backups")))
 
 
+def groups_file() -> Path:
+    return Path(os.environ.get("ALTPACA_GROUPS_FILE", str(HOME / ".altpaca" / "groups.json")))
+
+
+def load_groups() -> dict:
+    # custom groups are an altpaca concept (the app has none): {name: [session-uuid, ...]}
+    f = groups_file()
+    if f.exists():
+        try:
+            return json.loads(f.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_groups(groups: dict):
+    f = groups_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    cleaned = {name: sorted(set(members)) for name, members in groups.items() if members}
+    f.write_text(json.dumps(cleaned, indent=2))
+
+
 def die(msg: str, code: int = 1):
     print(f"altpaca: error: {msg}", file=sys.stderr)
     raise SystemExit(code)
@@ -231,19 +253,30 @@ def select(sessions: list, args) -> list:
     if getattr(args, "title", None):
         t = args.title.lower()
         out = [s for s in out if t in s.title.lower()]
+    if getattr(args, "group", None):
+        g = load_groups()
+        if args.group not in g:
+            die(f"no such group '{args.group}' (see: altpaca group list)")
+        members = set(g[args.group])
+        out = [s for s in out if s.uuid in members]
     if getattr(args, "skip_archived", False):
         out = [s for s in out if not s.archived]
     return out
 
 
 def has_positive_selector(args) -> bool:
-    return bool(getattr(args, "session", None) or getattr(args, "project", None) or getattr(args, "title", None))
+    return bool(
+        getattr(args, "session", None)
+        or getattr(args, "project", None)
+        or getattr(args, "title", None)
+        or getattr(args, "group", None)
+    )
 
 
 # --------------------------------------------------------------------------- #
 # printing
 # --------------------------------------------------------------------------- #
-def print_session_rows(sessions: list):
+def print_session_rows(sessions: list, groups: dict = None):
     for s in sorted(sessions, key=lambda x: x.last_activity, reverse=True):
         base = os.path.basename(s.cwd.rstrip("/")) or s.cwd or "?"
         flag = "A" if s.archived else " "
@@ -251,7 +284,13 @@ def print_session_rows(sessions: list):
         title = s.title.replace("\n", " ")
         if len(title) > 46:
             title = title[:45] + "…"
-        print(f"  {s.uuid[:8]}  {fmt_ts(s.created)}  {fmt_ts(s.last_activity)}  {flag}  {base[:18]:18}  {title}{miss}")
+        tag = ""
+        if groups:
+            names = [n for n, members in groups.items() if s.uuid in members]
+            if names:
+                tag = "  {" + ",".join(names) + "}"
+        row = f"  {s.uuid[:8]}  {fmt_ts(s.created)}  {fmt_ts(s.last_activity)}  {flag}  {base[:18]:18}  {title}"
+        print(f"{row}{miss}{tag}")
 
 
 # --------------------------------------------------------------------------- #
@@ -284,6 +323,7 @@ def cmd_accounts(args):
 
 def cmd_list(args):
     sessions = discover()
+    groups = load_groups()
     accounts = [resolve_account(args.account)] if args.account else all_accounts()
     if not accounts:
         print("no accounts found.")
@@ -299,7 +339,7 @@ def cmd_list(args):
             print()
         print(f"account {acc}  ({len(ss)} session(s)){mark}")
         print(f"  {'uuid':8}  {'first activity':16}  {'last activity':16}  {'':1}  {'project':18}  title")
-        print_session_rows(ss)
+        print_session_rows(ss, groups=groups)
         total += len(ss)
     if not args.account and len(accounts) > 1:
         print(f"\ntotal: {total} session(s) across {len(accounts)} account(s)")
@@ -563,6 +603,67 @@ def cmd_doctor(args):
             print(f"  {a}  workspaces={len(workspaces_of(a))}")
 
 
+def _group_select(args) -> list:
+    sessions = discover()
+    if args.account:
+        acc = resolve_account(args.account)
+        sessions = [s for s in sessions if s.account == acc]
+    if has_positive_selector(args) or args.all:
+        return select(sessions, args)
+    die("specify which sessions: --all or a selector (--session/--project/--title/--group)")
+
+
+def cmd_group_list(args):
+    groups = load_groups()
+    if not groups:
+        print("no groups yet. create one, e.g.:  altpaca group set work aaaaaaaa --project my-work")
+        return
+    index = {s.uuid: s for s in discover()}
+    for name in sorted(groups):
+        members = groups[name]
+        present = [index[u] for u in members if u in index]
+        print(f"{name}  ({len(present)} session(s))")
+        for s in sorted(present, key=lambda x: x.last_activity, reverse=True):
+            base = os.path.basename(s.cwd.rstrip("/")) or s.cwd or "?"
+            print(f"  {s.uuid[:8]}  {base[:18]:18}  {s.title[:50]}")
+        stale = len(members) - len(present)
+        if stale:
+            print(f"  ({stale} member(s) not currently present)")
+
+
+def cmd_group_set(args):
+    chosen = _group_select(args)
+    if not chosen:
+        die("no matching sessions")
+    groups = load_groups()
+    members = set(groups.get(args.name, []))
+    before = len(members)
+    members |= {s.uuid for s in chosen}
+    groups[args.name] = sorted(members)
+    save_groups(groups)
+    print(f"group '{args.name}': {len(members)} member(s) (+{len(members) - before})")
+
+
+def cmd_group_unset(args):
+    chosen = _group_select(args)
+    groups = load_groups()
+    if args.name not in groups:
+        die(f"no such group '{args.name}'")
+    members = set(groups[args.name]) - {s.uuid for s in chosen}
+    groups[args.name] = sorted(members)
+    save_groups(groups)
+    print(f"group '{args.name}': {len(members)} member(s)")
+
+
+def cmd_group_delete(args):
+    groups = load_groups()
+    if args.name not in groups:
+        die(f"no such group '{args.name}'")
+    del groups[args.name]
+    save_groups(groups)
+    print(f"deleted group '{args.name}'")
+
+
 # --------------------------------------------------------------------------- #
 # cli
 # --------------------------------------------------------------------------- #
@@ -571,6 +672,7 @@ def add_selectors(sp):
     sp.add_argument("--session", nargs="+", metavar="ID", help="select by session/cli uuid (prefix ok)")
     sp.add_argument("--project", metavar="PATH", help="select sessions whose cwd contains PATH")
     sp.add_argument("--title", metavar="SUBSTR", help="select sessions whose title contains SUBSTR (case-insensitive)")
+    sp.add_argument("--group", metavar="NAME", help="select sessions in a custom group (see: altpaca group)")
     sp.add_argument("--skip-archived", action="store_true", help="exclude archived sessions")
 
 
@@ -595,6 +697,24 @@ def build_parser():
     sp.add_argument("--out", metavar="DIR", help="output directory (default ~/.altpaca/dumps)")
     sp.add_argument("-n", "--dry-run", action="store_true", help="show filenames without writing")
     sp.set_defaults(func=cmd_dump)
+
+    gp = sub.add_parser("group", help="manage custom groups (altpaca-side labels for sessions)")
+    gsub = gp.add_subparsers(dest="group_cmd", required=True)
+    g = gsub.add_parser("list", help="list groups and their members")
+    g.set_defaults(func=cmd_group_list)
+    g = gsub.add_parser("set", help="add sessions to a group (creates it if new)")
+    g.add_argument("name")
+    g.add_argument("account", nargs="?", help="limit to one account (prefix ok)")
+    add_selectors(g)
+    g.set_defaults(func=cmd_group_set)
+    g = gsub.add_parser("unset", help="remove sessions from a group")
+    g.add_argument("name")
+    g.add_argument("account", nargs="?", help="limit to one account (prefix ok)")
+    add_selectors(g)
+    g.set_defaults(func=cmd_group_unset)
+    g = gsub.add_parser("delete", help="delete a group entirely")
+    g.add_argument("name")
+    g.set_defaults(func=cmd_group_delete)
 
     for name, helptext, remove in (
         ("move", "move sessions to another account (removes from source)", True),
