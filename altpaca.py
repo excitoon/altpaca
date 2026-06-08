@@ -73,6 +73,8 @@ def warn(msg: str):
 
 
 def fmt_ts(ms) -> str:
+    if not ms:
+        return "?"
     try:
         return datetime.fromtimestamp(int(ms) / 1000).strftime("%Y-%m-%d %H:%M")
     except Exception:
@@ -248,7 +250,7 @@ def print_session_rows(sessions: list):
         title = s.title.replace("\n", " ")
         if len(title) > 46:
             title = title[:45] + "…"
-        print(f"  {s.uuid[:8]}  {fmt_ts(s.last_activity)}  {flag}  {base[:18]:18}  {title}{miss}")
+        print(f"  {s.uuid[:8]}  {fmt_ts(s.created)}  {fmt_ts(s.last_activity)}  {flag}  {base[:18]:18}  {title}{miss}")
 
 
 # --------------------------------------------------------------------------- #
@@ -285,7 +287,7 @@ def cmd_list(args):
     if has_positive_selector(args) or args.skip_archived:
         ss = select(ss, args)
     print(f"account {acc}  ({len(ss)} session(s))")
-    print(f"  {'uuid':8}  {'last activity':16}  {'':1}  {'project':18}  title")
+    print(f"  {'uuid':8}  {'first activity':16}  {'last activity':16}  {'':1}  {'project':18}  title")
     print_session_rows(ss)
 
 
