@@ -586,9 +586,22 @@ def _slug(text: str, n: int = 40) -> str:
     return s[:n] or "session"
 
 
-def _dump_name(s: Session) -> str:
-    when = datetime.fromtimestamp(s.created / 1000).strftime("%Y%m%d-%H%M%S") if s.created else "00000000-000000"
-    return f"{when}_{s.uuid[:8]}_{_slug(s.title)}.altpaca.json"
+def _dump_name(s: Session, run_stamp: str) -> str:
+    created = datetime.fromtimestamp(s.created / 1000).strftime("%Y%m%d-%H%M%S") if s.created else "unknown"
+    return f"{created}_{s.uuid[:8]}_{_slug(s.title)}__{run_stamp}.altpaca.json"
+
+
+def _unique_path(p: Path) -> Path:
+    """Never overwrite: if p exists, append -2, -3, … before the .altpaca.json suffix."""
+    if not p.exists():
+        return p
+    stem = p.name[: -len(".altpaca.json")]
+    i = 2
+    while True:
+        cand = p.with_name(f"{stem}-{i}.altpaca.json")
+        if not cand.exists():
+            return cand
+        i += 1
 
 
 def _read_transcript(path: Path) -> list:
@@ -615,10 +628,11 @@ def cmd_dump(args):
         die("no matching sessions")
 
     out_dir = Path(args.out).expanduser() if args.out else (HOME / ".altpaca" / "dumps")
+    run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f"dumping {len(ss)} session(s) from {acc[:8]} -> {out_dir}")
     if args.dry_run:
         for s in ss:
-            print(f"  would write {_dump_name(s)}")
+            print(f"  would write {_dump_name(s, run_stamp)}")
         print("\n(dry-run) re-run without -n to write the files.")
         return
 
@@ -638,7 +652,7 @@ def cmd_dump(args):
             "transcript_file": str(tpath) if tpath else None,
             "transcript": _read_transcript(tpath) if tpath else None,
         }
-        dest = out_dir / _dump_name(s)
+        dest = _unique_path(out_dir / _dump_name(s, run_stamp))
         try:
             data = json.dumps(bundle, indent=2, ensure_ascii=False)
             # tolerate lone surrogates (broken emoji halves) in transcripts

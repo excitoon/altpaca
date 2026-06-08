@@ -68,7 +68,7 @@ altpaca move aaaaaaaa bbbbbbbb --session 11111111 22222222
 # copy instead of move (keep the originals in the source account)
 altpaca copy aaaaaaaa bbbbbbbb --all
 
-# export sessions to portable JSON (auto-named; metadata + full transcript)
+# export sessions to portable JSON (unique name per run — never overwrites)
 altpaca dump aaaaaaaa --all                       # -> ~/.altpaca/dumps/
 altpaca dump aaaaaaaa --session 33333333 --out .  # one session, into cwd
 altpaca dump aaaaaaaa --title shopping -n          # preview filenames only

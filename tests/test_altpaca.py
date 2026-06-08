@@ -170,6 +170,13 @@ def test_dump_handles_lone_surrogate(env, tmp_path):
     assert "altpaca_dump" in files[0].read_bytes().decode("utf-8")  # valid UTF-8, no crash
 
 
+def test_dump_never_overwrites(env, tmp_path):
+    out = tmp_path / "d"
+    altpaca.main(["dump", A[:8], "--all", "--out", str(out)])
+    altpaca.main(["dump", A[:8], "--all", "--out", str(out)])  # re-dump same sessions
+    assert len(list(out.glob("*.altpaca.json"))) == 6  # 3 + 3, nothing overwritten
+
+
 def test_list_all_accounts(env, capsys):
     altpaca.main(["list"])  # no account -> every account
     out = capsys.readouterr().out
