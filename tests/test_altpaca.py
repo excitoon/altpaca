@@ -145,7 +145,7 @@ def test_move_requires_selection(env):
 
 def test_dump_writes_archive(env, tmp_path):
     out = tmp_path / "dumps"
-    altpaca.main(["dump", A[:8], "--all", "--out", str(out)])
+    altpaca.main(["dump", A[:8], "--out", str(out)])  # whole account
     zips = list(out.glob("*.zip"))
     assert len(zips) == 1  # one archive per run
     with zipfile.ZipFile(zips[0]) as zf:
@@ -159,7 +159,7 @@ def test_dump_writes_archive(env, tmp_path):
 
 def test_dump_dry_run_writes_nothing(env, tmp_path, capsys):
     out = tmp_path / "dumps2"
-    altpaca.main(["dump", A[:8], "--project", "proj", "--out", str(out), "-n"])
+    altpaca.main(["dump", A[:8], "--out", str(out), "-n"])
     assert not out.exists() or not list(out.glob("*.zip"))
     assert "dry-run" in capsys.readouterr().out
 
@@ -169,18 +169,19 @@ def test_dump_handles_lone_surrogate(env, tmp_path):
     cli = "c1111111-1111-1111-1111-111111111111"
     (env.projects / "encoded" / f"{cli}.jsonl").write_text('{"text": "\\ud83d"}\n')
     out = tmp_path / "dumps3"
-    altpaca.main(["dump", A[:8], "--session", "11111111", "--out", str(out)])
+    altpaca.main(["dump", A[:8], "--out", str(out)])  # whole account incl. the corrupt one
     zips = list(out.glob("*.zip"))
     assert len(zips) == 1
     with zipfile.ZipFile(zips[0]) as zf:
-        data = zf.read(zf.namelist()[0])
-    assert "altpaca_dump" in data.decode("utf-8")  # valid UTF-8, no crash
+        texts = [zf.read(n).decode("utf-8") for n in zf.namelist()]  # no crash = valid UTF-8
+    assert len(texts) == 3
+    assert all("altpaca_dump" in t for t in texts)
 
 
 def test_dump_never_overwrites(env, tmp_path):
     out = tmp_path / "d"
-    altpaca.main(["dump", A[:8], "--all", "--out", str(out)])
-    altpaca.main(["dump", A[:8], "--all", "--out", str(out)])  # second run
+    altpaca.main(["dump", A[:8], "--out", str(out)])
+    altpaca.main(["dump", A[:8], "--out", str(out)])  # second run
     assert len(list(out.glob("*.zip"))) == 2  # one archive per run, no overwrite
 
 

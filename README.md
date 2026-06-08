@@ -68,16 +68,15 @@ altpaca move aaaaaaaa bbbbbbbb --session 11111111 22222222
 # copy instead of move (keep the originals in the source account)
 altpaca copy aaaaaaaa bbbbbbbb --all
 
-# export selected sessions into ONE .zip archive (one per run — never overwrites)
-altpaca dump aaaaaaaa --all                       # -> ~/.altpaca/dumps/altpaca-dump_*.zip
-altpaca dump aaaaaaaa --group Travel --out .       # archive into the current dir
-altpaca dump aaaaaaaa --title shopping -n          # preview the archive contents
+# archive a WHOLE account into ONE .zip (one per run — never overwrites)
+altpaca dump aaaaaaaa                              # -> ~/.altpaca/dumps/altpaca-dump_*.zip
+altpaca dump aaaaaaaa --out ~/backups/             # archive into another dir
+altpaca dump aaaaaaaa -n                           # preview the archive contents
 
 # groups — read from the app (Work, Home, Travel, …)
 altpaca groups                                      # list the app's groups + members
 altpaca list --group Home                       # filter (group shown as a column)
 altpaca move aaaaaaaa bbbbbbbb --group Travel       # move a whole group at once
-altpaca dump aaaaaaaa --group Work            # dump a group
 
 # undo the last operation
 altpaca restore 20260608-141230 --apply
@@ -112,7 +111,7 @@ a `session → group` map. altpaca reads them **read-only** via a small built-in
 leveldb/Snappy parser (no external deps); it never writes them back.
 
 - `altpaca groups` lists them with their members.
-- `--group NAME` selects a group anywhere (`list`/`move`/`copy`/`dump`), case-insensitive.
+- `--group NAME` selects a group in `list`/`move`/`copy`, case-insensitive.
 
 Moving a session between accounts is keyed by session id, so its group membership is
 unaffected. For the freshest read, quit the app first (recent group edits can sit in the

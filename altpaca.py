@@ -647,12 +647,8 @@ def _read_transcript(path: Path) -> list:
 def cmd_dump(args):
     acc = resolve_account(args.account)
     ss = [s for s in discover() if s.account == acc]
-    if has_positive_selector(args) or args.all:
-        ss = select(ss, args)
-    else:
-        die("refusing to dump everything implicitly — pass --all or a selector (--session/--project/--title)")
     if not ss:
-        die("no matching sessions")
+        die("no sessions in that account")
 
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     default_name = f"altpaca-dump_{acc[:8]}_{run_stamp}.zip"
@@ -948,11 +944,10 @@ def build_parser():
     add_selectors(sp)
     sp.set_defaults(func=cmd_list)
 
-    sp = sub.add_parser("dump", help="export sessions to portable auto-named JSON files (metadata + transcript)")
-    sp.add_argument("account", help="account uuid (prefix ok)")
-    add_selectors(sp)
-    sp.add_argument("--out", metavar="DIR", help="output directory (default ~/.altpaca/dumps)")
-    sp.add_argument("-n", "--dry-run", action="store_true", help="show filenames without writing")
+    sp = sub.add_parser("dump", help="archive a whole account's sessions into one .zip (metadata + transcripts)")
+    sp.add_argument("account", help="account uuid (prefix ok) — the entire account is archived")
+    sp.add_argument("--out", metavar="PATH", help="output dir, or a .zip path (default ~/.altpaca/dumps)")
+    sp.add_argument("-n", "--dry-run", action="store_true", help="show the archive contents without writing")
     sp.set_defaults(func=cmd_dump)
 
     sp = sub.add_parser("groups", help="list the app's custom groups and their members (read-only)")
