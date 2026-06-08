@@ -283,13 +283,26 @@ def cmd_accounts(args):
 
 
 def cmd_list(args):
-    acc = resolve_account(args.account)
-    ss = [s for s in discover() if s.account == acc]
-    if has_positive_selector(args) or args.skip_archived:
-        ss = select(ss, args)
-    print(f"account {acc}  ({len(ss)} session(s))")
-    print(f"  {'uuid':8}  {'first activity':16}  {'last activity':16}  {'':1}  {'project':18}  title")
-    print_session_rows(ss)
+    sessions = discover()
+    accounts = [resolve_account(args.account)] if args.account else all_accounts()
+    if not accounts:
+        print("no accounts found.")
+        return
+    cur = current_account(sessions)
+    total = 0
+    for i, acc in enumerate(accounts):
+        ss = [s for s in sessions if s.account == acc]
+        if has_positive_selector(args) or args.skip_archived:
+            ss = select(ss, args)
+        mark = "  <- current login (guess)" if (not args.account and acc == cur) else ""
+        if i:
+            print()
+        print(f"account {acc}  ({len(ss)} session(s)){mark}")
+        print(f"  {'uuid':8}  {'first activity':16}  {'last activity':16}  {'':1}  {'project':18}  title")
+        print_session_rows(ss)
+        total += len(ss)
+    if not args.account and len(accounts) > 1:
+        print(f"\ntotal: {total} session(s) across {len(accounts)} account(s)")
 
 
 def _slug(text: str, n: int = 40) -> str:
@@ -571,8 +584,8 @@ def build_parser():
     sp = sub.add_parser("accounts", help="list account partitions and their session counts")
     sp.set_defaults(func=cmd_accounts)
 
-    sp = sub.add_parser("list", help="list sessions in an account")
-    sp.add_argument("account", help="account uuid (prefix ok)")
+    sp = sub.add_parser("list", help="list sessions (all accounts if none given)")
+    sp.add_argument("account", nargs="?", help="account uuid (prefix ok; omit to list every account)")
     add_selectors(sp)
     sp.set_defaults(func=cmd_list)
 

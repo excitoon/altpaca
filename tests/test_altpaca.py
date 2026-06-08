@@ -156,3 +156,17 @@ def test_dump_dry_run_writes_nothing(env, tmp_path, capsys):
     altpaca.main(["dump", A[:8], "--project", "proj", "--out", str(out), "-n"])
     assert not out.exists() or not list(out.glob("*.json"))
     assert "dry-run" in capsys.readouterr().out
+
+
+def test_list_all_accounts(env, capsys):
+    altpaca.main(["list"])  # no account -> every account
+    out = capsys.readouterr().out
+    assert A in out and B in out  # both partitions shown
+    assert "total:" in out
+
+
+def test_list_single_account(env, capsys):
+    altpaca.main(["list", A[:8]])
+    out = capsys.readouterr().out
+    assert A in out and B not in out  # only the requested account
+    assert "total:" not in out
