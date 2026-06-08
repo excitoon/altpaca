@@ -355,6 +355,33 @@ def claude_running() -> bool:
     return False
 
 
+class Progress:
+    """Minimal in-place progress bar on a TTY; a no-op when piped/redirected."""
+
+    def __init__(self, total, label="", stream=None, width=24):
+        self.total = total
+        self.label = label
+        self.width = width
+        self.stream = stream if stream is not None else sys.stderr
+        self.enabled = total > 0 and hasattr(self.stream, "isatty") and self.stream.isatty()
+
+    def render(self, n, suffix=""):
+        if not self.enabled:
+            return
+        frac = max(0.0, min(1.0, n / self.total))
+        filled = int(self.width * frac)
+        bar = "#" * filled + "-" * (self.width - filled)
+        if len(suffix) > 32:
+            suffix = suffix[:31] + "…"
+        self.stream.write(f"\r{self.label}[{bar}] {n}/{self.total}  {suffix}\033[K")
+        self.stream.flush()
+
+    def finish(self):
+        if self.enabled:
+            self.stream.write("\r\033[K")  # clear the bar line
+            self.stream.flush()
+
+
 # --------------------------------------------------------------------------- #
 # model
 # --------------------------------------------------------------------------- #
@@ -645,8 +672,10 @@ def cmd_dump(args):
     archive.parent.mkdir(parents=True, exist_ok=True)
     added = failed = 0
     seen = set()
+    progress = Progress(len(ss), label="archiving ")
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-        for s in ss:
+        for i, s in enumerate(ss):
+            progress.render(i, s.title)
             tpath = s.transcript()
             bundle = {
                 "altpaca_dump": 1,
@@ -673,6 +702,7 @@ def cmd_dump(args):
                 warn(f"could not add {s.uuid[:8]}: {e}")
                 continue
             added += 1
+    progress.finish()
     suffix = f" ({failed} failed)" if failed else ""
     print(f"wrote {archive} — {added} session(s), {archive.stat().st_size} bytes{suffix}")
 

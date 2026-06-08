@@ -5,6 +5,7 @@ altpaca at it via ALTPACA_* env vars, so nothing touches a real install.
 """
 
 import argparse
+import io
 import json
 import zipfile
 
@@ -181,6 +182,26 @@ def test_dump_never_overwrites(env, tmp_path):
     altpaca.main(["dump", A[:8], "--all", "--out", str(out)])
     altpaca.main(["dump", A[:8], "--all", "--out", str(out)])  # second run
     assert len(list(out.glob("*.zip"))) == 2  # one archive per run, no overwrite
+
+
+def test_progress_noop_when_not_tty():
+    s = io.StringIO()  # isatty() -> False
+    p = altpaca.Progress(5, stream=s)
+    p.render(2, "x")
+    p.finish()
+    assert s.getvalue() == ""  # silent when not a terminal
+
+
+def test_progress_renders_on_tty():
+    class _TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    s = _TTY()
+    p = altpaca.Progress(4, label="go ", stream=s)
+    p.render(2, "hello")
+    assert "2/4" in s.getvalue()
+    assert "go " in s.getvalue()
 
 
 def test_list_all_accounts(env, capsys):
