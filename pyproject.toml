@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "altpaca"
+version = "0.1.0"
+description = "Move Claude Desktop sessions between account partitions."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Vladimir Chebotarev", email = "vladimir.chebotarev@gmail.com" }]
+keywords = ["claude", "claude-code", "sessions", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/excitoon/altpaca"
+Issues = "https://github.com/excitoon/altpaca/issues"
+
+[project.scripts]
+altpaca = "altpaca:main"
+
+[tool.setuptools]
+py-modules = ["altpaca"]
