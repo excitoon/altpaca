@@ -1,5 +1,7 @@
 # 🦙 altpaca
 
+[![ci](https://github.com/excitoon/altpaca/actions/workflows/ci.yml/badge.svg)](https://github.com/excitoon/altpaca/actions/workflows/ci.yml)
+
 Move Claude Desktop sessions between accounts. `altpaca` copies, verifies,
 then optionally removes — so your chat history follows you to your **alt** account
 instead of vanishing when you switch logins.
@@ -90,6 +92,13 @@ altpaca doctor
 This pokes at the desktop app's private on-disk layout, which Anthropic can change
 at any time. It is an unofficial tool — keep the backups. Set `ALTPACA_CLAUDE_DIR`
 to point at a non-default app-support location.
+
+## Environment
+
+- `ALTPACA_CLAUDE_DIR` — Claude app-support dir (default `~/Library/Application Support/Claude`).
+- `CLAUDE_CONFIG_DIR` — if set, transcripts are read from `$CLAUDE_CONFIG_DIR/projects` (matches Claude Code).
+- `ALTPACA_PROJECTS_DIR` — override the transcripts dir directly (wins over the above).
+- `ALTPACA_BACKUP_DIR` — where backups are written (default `~/.altpaca/backups`).
 
 ## License
 
