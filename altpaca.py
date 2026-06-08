@@ -34,8 +34,6 @@ from pathlib import Path
 
 HOME = Path.home()
 DEFAULT_BASE = HOME / "Library" / "Application Support" / "Claude"
-PROJECTS = HOME / ".claude" / "projects"
-BACKUP_ROOT = HOME / ".altpaca" / "backups"
 SESSIONS_DIRNAME = "claude-code-sessions"
 
 
@@ -48,6 +46,21 @@ def base_dir() -> Path:
 
 def sessions_root() -> Path:
     return base_dir() / SESSIONS_DIRNAME
+
+
+def projects_dir() -> Path:
+    # transcripts live alongside the active config dir; honor overrides
+    env = os.environ.get("ALTPACA_PROJECTS_DIR")
+    if env:
+        return Path(env)
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        return Path(cfg) / "projects"
+    return HOME / ".claude" / "projects"
+
+
+def backup_root() -> Path:
+    return Path(os.environ.get("ALTPACA_BACKUP_DIR", str(HOME / ".altpaca" / "backups")))
 
 
 def die(msg: str, code: int = 1):
@@ -105,7 +118,7 @@ class Session:
     @property
     def uuid(self) -> str:
         sid = self.session_id
-        return sid[len("local_"):] if sid.startswith("local_") else sid
+        return sid[len("local_") :] if sid.startswith("local_") else sid
 
     @property
     def cli_id(self) -> str:
@@ -134,7 +147,7 @@ class Session:
     def transcript(self):
         if not self.cli_id:
             return None
-        hits = glob.glob(str(PROJECTS / "*" / f"{self.cli_id}.jsonl"))
+        hits = glob.glob(str(projects_dir() / "*" / f"{self.cli_id}.jsonl"))
         return Path(hits[0]) if hits else None
 
     def matches(self, token: str) -> bool:
@@ -164,10 +177,7 @@ def workspaces_of(account: str) -> list:
 def discover() -> list:
     root = sessions_root()
     if not root.exists():
-        die(
-            f"sessions dir not found: {root}\n"
-            "is the Claude desktop app installed? set ALTPACA_CLAUDE_DIR to override."
-        )
+        die(f"sessions dir not found: {root}\nis the Claude desktop app installed? set ALTPACA_CLAUDE_DIR to override.")
     out = []
     for acc in sorted(p for p in root.iterdir() if p.is_dir()):
         for ws in sorted(p for p in acc.iterdir() if p.is_dir()):
@@ -259,9 +269,7 @@ def cmd_accounts(args):
         wss = workspaces_of(acc)
         mark = "  <- current login (guess)" if acc == cur else ""
         print(f"{acc}")
-        print(
-            f"  sessions={len(ss)}  archived={arch}  projects={projs}  workspaces={len(wss)}{mark}"
-        )
+        print(f"  sessions={len(ss)}  archived={arch}  projects={projs}  workspaces={len(wss)}{mark}")
         newest = max(ss, key=lambda s: s.last_activity, default=None)
         if newest:
             print(f"  newest: {fmt_ts(newest.last_activity)}  {newest.title[:54]}")
@@ -283,7 +291,7 @@ def cmd_list(args):
 
 def make_backup(originals: list, dests: list) -> Path:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    bdir = BACKUP_ROOT / ts
+    bdir = backup_root() / ts
     fdir = bdir / "files"
     fdir.mkdir(parents=True, exist_ok=True)
     manifest = {
@@ -426,7 +434,7 @@ def cmd_copy(args):
 
 def cmd_restore(args):
     ref = args.backup
-    bdir = Path(ref) if ("/" in ref or os.path.isabs(ref)) else BACKUP_ROOT / ref
+    bdir = Path(ref) if ("/" in ref or os.path.isabs(ref)) else backup_root() / ref
     man_path = bdir / "manifest.json"
     if not man_path.exists():
         die(f"no manifest at {man_path}")
@@ -462,8 +470,9 @@ def cmd_restore(args):
 def cmd_doctor(args):
     print(f"base dir         : {base_dir()}  ({'ok' if base_dir().exists() else 'MISSING'})")
     print(f"sessions root    : {sessions_root()}  ({'ok' if sessions_root().exists() else 'MISSING'})")
-    print(f"projects dir     : {PROJECTS}  ({'ok' if PROJECTS.exists() else 'MISSING'})")
-    print(f"backup root      : {BACKUP_ROOT}")
+    pj = projects_dir()
+    print(f"projects dir     : {pj}  ({'ok' if pj.exists() else 'MISSING'})")
+    print(f"backup root      : {backup_root()}")
     print(f"Claude running   : {'yes (quit before moving)' if claude_running() else 'no'}")
     print(f"env session id   : {os.environ.get('CLAUDE_CODE_SESSION_ID', '(unset)')}")
     if sessions_root().exists():
