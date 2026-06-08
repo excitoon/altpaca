@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -586,19 +587,18 @@ def _slug(text: str, n: int = 40) -> str:
     return s[:n] or "session"
 
 
-def _dump_name(s: Session, run_stamp: str) -> str:
+def _entry_name(s: Session) -> str:
     created = datetime.fromtimestamp(s.created / 1000).strftime("%Y%m%d-%H%M%S") if s.created else "unknown"
-    return f"{created}_{s.uuid[:8]}_{_slug(s.title)}__{run_stamp}.altpaca.json"
+    return f"{created}_{s.uuid[:8]}_{_slug(s.title)}.altpaca.json"
 
 
 def _unique_path(p: Path) -> Path:
-    """Never overwrite: if p exists, append -2, -3, … before the .altpaca.json suffix."""
+    """Never overwrite: if p exists, append -2, -3, … before the suffix."""
     if not p.exists():
         return p
-    stem = p.name[: -len(".altpaca.json")]
     i = 2
     while True:
-        cand = p.with_name(f"{stem}-{i}.altpaca.json")
+        cand = p.with_name(f"{p.stem}-{i}{p.suffix}")
         if not cand.exists():
             return cand
         i += 1
@@ -627,45 +627,54 @@ def cmd_dump(args):
     if not ss:
         die("no matching sessions")
 
-    out_dir = Path(args.out).expanduser() if args.out else (HOME / ".altpaca" / "dumps")
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    print(f"dumping {len(ss)} session(s) from {acc[:8]} -> {out_dir}")
+    default_name = f"altpaca-dump_{acc[:8]}_{run_stamp}.zip"
+    if args.out:
+        o = Path(args.out).expanduser()
+        archive = o if o.suffix == ".zip" else o / default_name
+    else:
+        archive = HOME / ".altpaca" / "dumps" / default_name
+    archive = _unique_path(archive)
+    print(f"dumping {len(ss)} session(s) from {acc[:8]} -> {archive}")
     if args.dry_run:
         for s in ss:
-            print(f"  would write {_dump_name(s, run_stamp)}")
-        print("\n(dry-run) re-run without -n to write the files.")
+            print(f"  would add {_entry_name(s)}")
+        print(f"\n(dry-run) would write 1 archive: {archive.name}")
         return
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    written = failed = 0
-    for s in ss:
-        tpath = s.transcript()
-        bundle = {
-            "altpaca_dump": 1,
-            "exported_at": datetime.now().isoformat(timespec="seconds"),
-            "source_account": acc,
-            "source_workspace": s.workspace,
-            "session_file": s.path.name,
-            "metadata": s.meta,
-            "cwd": s.cwd,
-            "cli_session_id": s.cli_id,
-            "transcript_file": str(tpath) if tpath else None,
-            "transcript": _read_transcript(tpath) if tpath else None,
-        }
-        dest = _unique_path(out_dir / _dump_name(s, run_stamp))
-        try:
-            data = json.dumps(bundle, indent=2, ensure_ascii=False)
-            # tolerate lone surrogates (broken emoji halves) in transcripts
-            dest.write_bytes(data.encode("utf-8", "replace"))
-        except Exception as e:
-            failed += 1
-            warn(f"could not dump {s.uuid[:8]}: {e}")
-            continue
-        written += 1
-        tag = "" if tpath else "  (no transcript)"
-        print(f"  {dest.name}  ({dest.stat().st_size} bytes){tag}")
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    added = failed = 0
+    seen = set()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        for s in ss:
+            tpath = s.transcript()
+            bundle = {
+                "altpaca_dump": 1,
+                "exported_at": datetime.now().isoformat(timespec="seconds"),
+                "source_account": acc,
+                "source_workspace": s.workspace,
+                "session_file": s.path.name,
+                "metadata": s.meta,
+                "cwd": s.cwd,
+                "cli_session_id": s.cli_id,
+                "transcript_file": str(tpath) if tpath else None,
+                "transcript": _read_transcript(tpath) if tpath else None,
+            }
+            name = _entry_name(s)
+            while name in seen:  # guard against rare uuid8+title collision
+                name = name[: -len(".altpaca.json")] + "_.altpaca.json"
+            seen.add(name)
+            try:
+                # tolerate lone surrogates (broken emoji halves) in transcripts
+                data = json.dumps(bundle, indent=2, ensure_ascii=False).encode("utf-8", "replace")
+                zf.writestr(name, data)
+            except Exception as e:
+                failed += 1
+                warn(f"could not add {s.uuid[:8]}: {e}")
+                continue
+            added += 1
     suffix = f" ({failed} failed)" if failed else ""
-    print(f"\nwrote {written} file(s) to {out_dir}{suffix}")
+    print(f"wrote {archive} — {added} session(s), {archive.stat().st_size} bytes{suffix}")
 
 
 def make_backup(originals: list, dests: list) -> Path:

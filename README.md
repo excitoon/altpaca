@@ -68,10 +68,10 @@ altpaca move aaaaaaaa bbbbbbbb --session 11111111 22222222
 # copy instead of move (keep the originals in the source account)
 altpaca copy aaaaaaaa bbbbbbbb --all
 
-# export sessions to portable JSON (unique name per run — never overwrites)
-altpaca dump aaaaaaaa --all                       # -> ~/.altpaca/dumps/
-altpaca dump aaaaaaaa --session 33333333 --out .  # one session, into cwd
-altpaca dump aaaaaaaa --title shopping -n          # preview filenames only
+# export selected sessions into ONE .zip archive (one per run — never overwrites)
+altpaca dump aaaaaaaa --all                       # -> ~/.altpaca/dumps/altpaca-dump_*.zip
+altpaca dump aaaaaaaa --group Travel --out .       # archive into the current dir
+altpaca dump aaaaaaaa --title shopping -n          # preview the archive contents
 
 # groups — read from the app (Work, Home, Travel, …)
 altpaca groups                                      # list the app's groups + members

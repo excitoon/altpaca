@@ -6,6 +6,7 @@ altpaca at it via ALTPACA_* env vars, so nothing touches a real install.
 
 import argparse
 import json
+import zipfile
 
 import pytest
 
@@ -141,21 +142,24 @@ def test_move_requires_selection(env):
         altpaca.main(["move", A[:8], B[:8]])  # no --all / selector
 
 
-def test_dump_writes_bundles(env, tmp_path):
+def test_dump_writes_archive(env, tmp_path):
     out = tmp_path / "dumps"
     altpaca.main(["dump", A[:8], "--all", "--out", str(out)])
-    files = sorted(out.glob("*.altpaca.json"))
-    assert len(files) == 3
-    bundle = json.loads(files[0].read_text())
-    assert bundle["altpaca_dump"] == 1
-    assert bundle["metadata"]["cliSessionId"]
-    assert bundle["transcript"] is not None  # transcript embedded
+    zips = list(out.glob("*.zip"))
+    assert len(zips) == 1  # one archive per run
+    with zipfile.ZipFile(zips[0]) as zf:
+        names = zf.namelist()
+        assert len(names) == 3  # one entry per session
+        bundle = json.loads(zf.read(names[0]))
+        assert bundle["altpaca_dump"] == 1
+        assert bundle["metadata"]["cliSessionId"]
+        assert bundle["transcript"] is not None
 
 
 def test_dump_dry_run_writes_nothing(env, tmp_path, capsys):
     out = tmp_path / "dumps2"
     altpaca.main(["dump", A[:8], "--project", "proj", "--out", str(out), "-n"])
-    assert not out.exists() or not list(out.glob("*.json"))
+    assert not out.exists() or not list(out.glob("*.zip"))
     assert "dry-run" in capsys.readouterr().out
 
 
@@ -165,16 +169,18 @@ def test_dump_handles_lone_surrogate(env, tmp_path):
     (env.projects / "encoded" / f"{cli}.jsonl").write_text('{"text": "\\ud83d"}\n')
     out = tmp_path / "dumps3"
     altpaca.main(["dump", A[:8], "--session", "11111111", "--out", str(out)])
-    files = list(out.glob("*.altpaca.json"))
-    assert len(files) == 1
-    assert "altpaca_dump" in files[0].read_bytes().decode("utf-8")  # valid UTF-8, no crash
+    zips = list(out.glob("*.zip"))
+    assert len(zips) == 1
+    with zipfile.ZipFile(zips[0]) as zf:
+        data = zf.read(zf.namelist()[0])
+    assert "altpaca_dump" in data.decode("utf-8")  # valid UTF-8, no crash
 
 
 def test_dump_never_overwrites(env, tmp_path):
     out = tmp_path / "d"
     altpaca.main(["dump", A[:8], "--all", "--out", str(out)])
-    altpaca.main(["dump", A[:8], "--all", "--out", str(out)])  # re-dump same sessions
-    assert len(list(out.glob("*.altpaca.json"))) == 6  # 3 + 3, nothing overwritten
+    altpaca.main(["dump", A[:8], "--all", "--out", str(out)])  # second run
+    assert len(list(out.glob("*.zip"))) == 2  # one archive per run, no overwrite
 
 
 def test_list_all_accounts(env, capsys):
