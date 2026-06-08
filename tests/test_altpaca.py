@@ -125,8 +125,8 @@ def test_apply_move_then_restore_roundtrip(env):
     assert _src_files(env) == []
     assert len(_dst_files(env)) == 3
 
-    backups = sorted(p for p in env.backups.iterdir() if p.is_dir())
-    assert backups, "a backup should have been written"
+    backups = sorted(env.backups.glob("*.zip"))
+    assert backups, "a backup archive should have been written"
     altpaca.main(["restore", backups[-1].name, "--apply", "--yes"])
     assert len(_src_files(env)) == 3
     assert _dst_files(env) == []

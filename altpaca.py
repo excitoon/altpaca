@@ -705,11 +705,9 @@ def cmd_dump(args):
 
 def make_backup(originals: list, dests: list) -> Path:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    bdir = backup_root() / ts
-    fdir = bdir / "files"
-    fdir.mkdir(parents=True, exist_ok=True)
+    archive = _unique_path(backup_root() / f"altpaca-backup_{ts}.zip")
     manifest = {
-        "version": 1,
+        "version": 2,
         "created_at": ts,
         "sessions_root": str(sessions_root()),
         "originals": [],
@@ -724,12 +722,17 @@ def make_backup(originals: list, dests: list) -> Path:
             to_backup.add(Path(d))  # pre-existing destination (would be clobbered)
         else:
             manifest["created_destinations"].append(str(d))
+    entries = []
     for i, p in enumerate(sorted(to_backup)):
-        bf = fdir / f"{i:04d}_{p.name}"
-        shutil.copy2(p, bf)
-        manifest["originals"].append({"path": str(p), "backup": str(bf.relative_to(bdir))})
-    (bdir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    return bdir
+        arc = f"files/{i:04d}_{p.name}"
+        entries.append((arc, p))
+        manifest["originals"].append({"path": str(p), "backup": arc})
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+        for arc, p in entries:
+            zf.write(p, arc)
+    return archive
 
 
 def transfer(args, remove_source: bool):
@@ -848,36 +851,47 @@ def cmd_copy(args):
 
 def cmd_restore(args):
     ref = args.backup
-    bdir = Path(ref) if ("/" in ref or os.path.isabs(ref)) else backup_root() / ref
-    man_path = bdir / "manifest.json"
-    if not man_path.exists():
-        die(f"no manifest at {man_path}")
-    man = json.loads(man_path.read_text())
+    candidates = [
+        Path(ref),
+        backup_root() / ref,
+        backup_root() / f"{ref}.zip",
+        backup_root() / f"altpaca-backup_{ref}.zip",
+    ]
+    archive = next((c for c in candidates if c.exists() and c.is_file()), None)
+    if archive is None:
+        die(f"backup not found: {ref}")
+    try:
+        zf = zipfile.ZipFile(archive)
+    except zipfile.BadZipFile:
+        die(f"not a valid backup archive: {archive}")
+    with zf:
+        try:
+            man = json.loads(zf.read("manifest.json"))
+        except KeyError:
+            die(f"not an altpaca backup (no manifest): {archive}")
+        created = [Path(p) for p in man.get("created_destinations", [])]
+        originals = man.get("originals", [])
+        print(f"restore from {archive}")
+        print(f"  remove {len(created)} created file(s); restore {len(originals)} original(s)")
 
-    created = [Path(p) for p in man.get("created_destinations", [])]
-    originals = man.get("originals", [])
-    print(f"restore from {bdir}")
-    print(f"  remove {len(created)} created file(s); restore {len(originals)} original(s)")
+        if not args.apply:
+            print("DRY-RUN — nothing changed. Re-run with --apply.")
+            return
+        if claude_running() and not args.force:
+            die("quit the Claude desktop app first, then retry (or use --force).")
+        if not args.yes:
+            if not sys.stdin.isatty():
+                die("refusing to apply without confirmation; pass --yes")
+            if input("Proceed to restore? [y/N] ").strip().lower() not in ("y", "yes"):
+                die("aborted")
 
-    if not args.apply:
-        print("DRY-RUN — nothing changed. Re-run with --apply.")
-        return
-    if claude_running() and not args.force:
-        die("quit the Claude desktop app first, then retry (or use --force).")
-    if not args.yes:
-        if not sys.stdin.isatty():
-            die("refusing to apply without confirmation; pass --yes")
-        if input("Proceed to restore? [y/N] ").strip().lower() not in ("y", "yes"):
-            die("aborted")
-
-    for p in created:
-        if p.exists():
-            p.unlink()
-    for o in originals:
-        dst = Path(o["path"])
-        src = bdir / o["backup"]
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        for p in created:
+            if p.exists():
+                p.unlink()
+        for o in originals:
+            dst = Path(o["path"])
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(zf.read(o["backup"]))
     print("restored. restart the Claude desktop app to see the result.")
 
 
@@ -969,7 +983,7 @@ def build_parser():
         sp.set_defaults(func=cmd_move if remove else cmd_copy)
 
     sp = sub.add_parser("restore", help="undo a previous move/copy from its backup")
-    sp.add_argument("backup", help="backup id (timestamp) or path under ~/.altpaca/backups")
+    sp.add_argument("backup", help="backup archive name/path (or its timestamp) under ~/.altpaca/backups")
     sp.add_argument("--apply", action="store_true")
     sp.add_argument("-y", "--yes", action="store_true")
     sp.add_argument("--force", action="store_true")

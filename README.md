@@ -88,8 +88,8 @@ altpaca doctor
 ## Safety
 
 - **Dry-run by default.** `move`/`copy` only print a plan unless you pass `--apply`.
-- **Backups.** Every applied operation snapshots the affected files to
-  `~/.altpaca/backups/<timestamp>/` with a manifest; `altpaca restore <id>` reverts it.
+- **Backups.** Every applied move/copy snapshots the affected files into a single
+  `~/.altpaca/backups/altpaca-backup_<timestamp>.zip`; `altpaca restore <name>` reverts it.
 - **Verify before delete.** A move copies, sha256-checks the copy, *then* removes the
   source.
 - **Won't fight the app.** Refuses to apply while Claude is running.
