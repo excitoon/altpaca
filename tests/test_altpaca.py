@@ -63,7 +63,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("ALTPACA_BACKUP_DIR", str(backups))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
-    monkeypatch.setattr(altpaca, "_NATIVE_CACHE", None, raising=False)
+    monkeypatch.setattr(altpaca, "_NATIVE_CACHE", {}, raising=False)
+    # stay hermetic: don't let a real running Claude.app trip the apply-guard
+    monkeypatch.setattr(altpaca, "claude_running", lambda: False)
     return argparse.Namespace(base=base, ccs=ccs, projects=projects, backups=backups)
 
 
@@ -91,7 +93,10 @@ def test_uuid_and_transcript(env):
 
 
 def test_resolve_account_prefix_and_errors(env):
-    assert altpaca.resolve_account("aaaa") == A
+    acc = altpaca.resolve_account("aaaa")
+    assert acc.ref == A
+    assert acc.uuid == A
+    assert acc.tenant.name == ""  # default tenant -> bare uuid ref
     with pytest.raises(SystemExit):
         altpaca.resolve_account("zzzz")  # no match
 
@@ -247,7 +252,7 @@ def test_parse_dframe_groups():
 
 def _fake_native(monkeypatch):
     u_alpha = "11111111-1111-1111-1111-111111111111"
-    monkeypatch.setattr(altpaca, "native_groups", lambda: ({u_alpha: "Work"}, ["Work", "Home"]))
+    monkeypatch.setattr(altpaca, "native_groups", lambda tenant=None: ({u_alpha: "Work"}, ["Work", "Home"]))
     return u_alpha
 
 
@@ -274,6 +279,296 @@ def test_groups_command(env, monkeypatch, capsys):
 
 
 def test_unknown_group_errors(env, monkeypatch):
-    monkeypatch.setattr(altpaca, "native_groups", lambda: ({}, ["Work"]))
+    monkeypatch.setattr(altpaca, "native_groups", lambda tenant=None: ({}, ["Work"]))
     with pytest.raises(SystemExit):
         altpaca.main(["list", A[:8], "--group", "nope"])
+
+
+# --------------------------------------------------------------------------- #
+# tenants: a sibling "Claude-<suffix>" dir is a second tenant; its accounts are
+# addressed "<suffix>/<uuid>" while the default tenant stays bare "<uuid>".
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def two_tenants(env):
+    """Add a 'Claude-excitoon' tenant that shares account uuid A with the default."""
+    alt = env.base.parent / "Claude-excitoon"
+    accs = alt / "claude-code-sessions"
+    wsx = "wx000000-0000-0000-0000-0000000000xx"
+    (accs / A / wsx).mkdir(parents=True)
+    uuid = "44444444-4444-4444-4444-444444444444"
+    cli = "c4444444-4444-4444-4444-444444444444"
+    (accs / A / wsx / f"local_{uuid}.json").write_text(json.dumps(_meta(uuid, cli, "/Users/x/alt", "Delta", False)))
+    (env.projects / "encoded" / f"{cli}.jsonl").write_text("{}\n")
+    return argparse.Namespace(alt=alt, uuid=uuid, ws=wsx)
+
+
+def test_tenant_discovery_and_refs(two_tenants):
+    tenants = altpaca.discover_tenants()
+    assert sorted(t.name for t in tenants) == ["", "excitoon"]
+    # account uuid A exists in BOTH tenants -> two distinct refs
+    assert set(altpaca.all_accounts()) == {A, B, f"excitoon/{A}"}
+
+
+def test_bare_ref_is_default_tenant(two_tenants):
+    acc = altpaca.resolve_account(A[:8])  # bare -> default tenant only
+    assert acc.tenant.name == ""
+    assert acc.ref == A
+
+
+def test_tenant_qualified_ref_resolves(two_tenants):
+    acc = altpaca.resolve_account(f"excitoon/{A[:8]}")
+    assert acc.tenant.name == "excitoon"
+    assert acc.ref == f"excitoon/{A}"
+    # the session living only in the excitoon tenant is discoverable there
+    ss = [s for s in altpaca.discover() if s.account_ref == acc.ref]
+    assert [s.title for s in ss] == ["Delta"]
+
+
+def test_cross_tenant_move_warns_about_groups(two_tenants, capsys):
+    altpaca.main(["move", f"excitoon/{A[:8]}", A[:8], "--all"])
+    err = capsys.readouterr().err
+    assert "cross-tenant" in err and "GROUP membership will NOT carry" in err
+    assert "--regroup" in err  # the warning now points at the fix
+
+
+# --------------------------------------------------------------------------- #
+# leveldb WRITE path + regroup. We build a minimal-but-real Chromium Local
+# Storage leveldb (CURRENT + MANIFEST + .log) using altpaca's own writer
+# primitives, then read it back through altpaca's reader — so a regroup write is
+# verified end-to-end through the same code the desktop app's leveldb uses.
+# --------------------------------------------------------------------------- #
+LS_KEY = b"_https://claude.ai\x00\x01dframe-store"
+
+
+def test_leveldb_write_primitives_match_spec():
+    # CRC32C (Castagnoli) test vectors verified against google/leveldb, NOT IEEE CRC32.
+    assert altpaca._crc32c(b"") == 0x00000000
+    assert altpaca._crc32c(b"123456789") == 0xE3069283
+    assert altpaca._mask_crc(0xE3069283) == 0xC78AB0E5
+    # base-128 varint
+    assert altpaca._ldb_varint(0) == b"\x00"
+    assert altpaca._ldb_varint(128) == b"\x80\x01"
+    assert altpaca._ldb_varint(300) == b"\xac\x02"
+    # DOM-Storage value framing: 0x01+Latin-1 vs 0x00+UTF-16LE by content
+    assert altpaca._encode_ls_value('"') == b"\x01\x22"
+    assert altpaca._encode_ls_value("да") == b"\x00" + "да".encode("utf-16-le")
+
+
+def test_write_batch_frame_roundtrips_through_reader():
+    payload = altpaca._write_batch(4242, LS_KEY, altpaca._encode_ls_value('{"x":1}'))
+    framed = altpaca._frame_log_append(payload, 0)  # append into an empty file
+    recs = altpaca._log_record_payloads(framed)
+    assert len(recs) == 1 and recs[0] == payload
+
+
+def test_frame_append_spans_block_boundary():
+    # append a >1-block payload AFTER a real first record: it must fragment
+    # (FIRST/MIDDLE/LAST) across 32 KiB boundaries and still reassemble exactly.
+    p1 = altpaca._write_batch(1, LS_KEY, altpaca._encode_ls_value("x"))
+    framed1 = altpaca._frame_log_append(p1, 0)
+    p2 = altpaca._write_batch(7, LS_KEY, altpaca._encode_ls_value("v" * 40000))
+    framed2 = altpaca._frame_log_append(p2, len(framed1))  # block_offset seeded from file size
+    assert altpaca._log_record_payloads(framed1 + framed2) == [p1, p2]
+
+
+def test_frame_append_pads_sub_header_block_tail():
+    # with fewer than 7 bytes left in the block, the tail is zero-padded first
+    framed = altpaca._frame_log_append(altpaca._write_batch(1, b"k", b"\x01v"), 32768 - 3)
+    assert framed[:3] == b"\x00\x00\x00"
+
+
+def test_frame_append_empty_first_at_seven_byte_tail_roundtrips():
+    # exactly 7 bytes left -> leveldb emits a 0-byte FIRST record then spills into
+    # the next block. Appending after a real record at that offset must still read back.
+    p1 = altpaca._write_batch(1, LS_KEY, altpaca._encode_ls_value("x"))
+    framed1 = altpaca._frame_log_append(p1, 0)
+    # pick a payload size so the file lands exactly 7 bytes from a block boundary,
+    # then append a second record there.
+    pad_target = 32768 - 7 - len(framed1)
+    p2 = altpaca._write_batch(2, b"k", b"\x01" + b"y" * pad_target)
+    framed2 = altpaca._frame_log_append(p2, len(framed1))
+    assert len(framed1 + framed2) > 32768  # genuinely crossed a block
+    p3 = altpaca._write_batch(3, LS_KEY, altpaca._encode_ls_value("z"))
+    framed3 = altpaca._frame_log_append(p3, len(framed1 + framed2))
+    assert altpaca._log_record_payloads(framed1 + framed2 + framed3) == [p1, p2, p3]
+
+
+def _version_edit(log_number, last_seq):
+    return bytes([2]) + altpaca._ldb_varint(log_number) + bytes([4]) + altpaca._ldb_varint(last_seq)
+
+
+def test_version_edit_parse_roundtrip():
+    edit = altpaca._parse_version_edit(_version_edit(7, 1234))
+    assert edit[2] == 7 and edit[4] == 1234
+
+
+def _build_ls(base, store, *, seq, log_number=5, last_seq=None):
+    """Write a minimal valid leveldb for `store` under <base>/Local Storage/leveldb."""
+    last_seq = seq if last_seq is None else last_seq
+    ls = base / "Local Storage" / "leveldb"
+    ls.mkdir(parents=True, exist_ok=True)
+    # the dframe-store value, plus a VERSION='1' row so the schema guard is happy
+    text = json.dumps(store, separators=(",", ":"))
+    batch = (
+        altpaca._write_batch(seq, LS_KEY, altpaca._encode_ls_value(text))
+        + b""  # (one record; VERSION written as its own record below)
+    )
+    log_bytes = altpaca._frame_log_append(batch, 0)
+    ver_batch = altpaca._write_batch(seq - 1, b"VERSION", altpaca._encode_ls_value("1"))
+    log_bytes = log_bytes + altpaca._frame_log_append(ver_batch, len(log_bytes))
+    (ls / f"{log_number:06d}.log").write_bytes(log_bytes)
+    (ls / "CURRENT").write_text("MANIFEST-000001\n")
+    (ls / "MANIFEST-000001").write_bytes(altpaca._frame_log_append(_version_edit(log_number, last_seq), 0))
+    return ls
+
+
+def _read_store(ls):
+    merged, _ = altpaca._merge_ls(ls)
+    _key, store = altpaca._dframe_record(merged)
+    return altpaca._store_state(store)
+
+
+WORK = "cg-work0000-0000-0000-0000-000000000000"
+HOME = "cg-home0000-0000-0000-0000-000000000000"
+WORK_DST = "cg-workdst0-0000-0000-0000-000000000000"
+
+
+def _src_store():
+    # source tenant: Alpha(11111111) in Work, Beta(22222222) in Home
+    return {
+        "state": {
+            "customGroups": [{"id": WORK, "name": "Work"}, {"id": HOME, "name": "Home"}],
+            "customGroupAssignments": {
+                "code:local_11111111-1111-1111-1111-111111111111": WORK,
+                "code:local_22222222-2222-2222-2222-222222222222": HOME,
+            },
+            "customGroupOrder": [WORK, HOME],
+        },
+        "version": 0,
+    }
+
+
+def _dst_store(assignments=None):
+    # destination tenant already has a "Work" group (different id), no "Home"
+    return {
+        "state": {
+            "customGroups": [{"id": WORK_DST, "name": "Work"}],
+            "customGroupAssignments": assignments or {},
+            "customGroupOrder": [WORK_DST],
+        },
+        "version": 0,
+    }
+
+
+@pytest.fixture
+def regroup_env(env):
+    """Default tenant = source (has groups). excitoon tenant = destination.
+    Move Alpha+Beta into excitoon so they physically live there, ungrouped."""
+    alt = env.base.parent / "Claude-excitoon"
+    (alt / "claude-code-sessions" / B / WB).mkdir(parents=True)
+    _build_ls(env.base, _src_store(), seq=100, log_number=3)
+    _build_ls(alt, _dst_store(), seq=50, log_number=7)
+    # physically relocate Alpha + Beta into the excitoon tenant (as a move would)
+    import shutil as _sh
+
+    for uuid in ("11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"):
+        srcf = env.ccs / A / WA / f"local_{uuid}.json"
+        _sh.copy(srcf, alt / "claude-code-sessions" / B / WB / f"local_{uuid}.json")
+        srcf.unlink()
+    return argparse.Namespace(alt=alt, dst_ls=alt / "Local Storage" / "leveldb")
+
+
+def test_recover_source_group_names(regroup_env, env):
+    got = altpaca.recover_source_group_names(env.base / "Local Storage" / "leveldb")
+    assert got["11111111-1111-1111-1111-111111111111"] == "Work"
+    assert got["22222222-2222-2222-2222-222222222222"] == "Home"
+
+
+def test_ldb_active_log_uses_manifest(regroup_env):
+    log_path, last_seq = altpaca._ldb_active_log(regroup_env.dst_ls)
+    assert log_path.name == "000007.log"  # the manifest's log_number, not "highest by chance"
+    assert last_seq == 50
+
+
+def test_regroup_dry_run_writes_nothing(regroup_env, capsys):
+    before = (regroup_env.dst_ls / "000007.log").read_bytes()
+    altpaca.main(["regroup", A[:8], f"excitoon/{B[:8]}"])  # no --apply
+    out = capsys.readouterr().out
+    assert "DRY-RUN" in out
+    assert (regroup_env.dst_ls / "000007.log").read_bytes() == before  # untouched
+    assert "11111111" not in _read_store(regroup_env.dst_ls).get("customGroupAssignments", {})
+
+
+def test_regroup_apply_assigns_by_name_and_creates_missing(regroup_env):
+    altpaca.main(["regroup", A[:8], f"excitoon/{B[:8]}", "--apply", "--yes"])
+    st = _read_store(regroup_env.dst_ls)
+    asg = st["customGroupAssignments"]
+    name_by_id = {g["id"]: g["name"] for g in st["customGroups"]}
+    # Alpha -> the destination's existing "Work" id (matched by NAME, not source id)
+    a_id = asg["code:local_11111111-1111-1111-1111-111111111111"]
+    assert name_by_id[a_id] == "Work" and a_id == WORK_DST
+    # Beta -> a freshly minted "Home" group (absent in destination before)
+    b_id = asg["code:local_22222222-2222-2222-2222-222222222222"]
+    assert name_by_id[b_id] == "Home" and b_id != HOME
+    assert b_id in st["customGroupOrder"]  # new group ordered in the sidebar
+
+
+def test_regroup_skips_already_grouped_unless_force(regroup_env):
+    # pre-assign Alpha to the destination's Work; regroup must leave it alone...
+    pre = {"code:local_11111111-1111-1111-1111-111111111111": WORK_DST}
+    _build_ls(regroup_env.alt, _dst_store(pre), seq=50, log_number=7)
+    altpaca.main(["regroup", A[:8], f"excitoon/{B[:8]}", "--apply", "--yes"])
+    st = _read_store(regroup_env.dst_ls)
+    assert st["customGroupAssignments"]["code:local_11111111-1111-1111-1111-111111111111"] == WORK_DST
+    # Beta still gets grouped (it was unassigned)
+    assert "code:local_22222222-2222-2222-2222-222222222222" in st["customGroupAssignments"]
+
+
+def test_regroup_backup_then_restore_reverts_write(regroup_env, env):
+    akey = "code:local_11111111-1111-1111-1111-111111111111"
+    altpaca.main(["regroup", A[:8], f"excitoon/{B[:8]}", "--apply", "--yes"])
+    assert akey in _read_store(regroup_env.dst_ls)["customGroupAssignments"]
+    backups = sorted(env.backups.glob("*.zip"))
+    assert backups, "regroup should have written a backup"
+    altpaca.main(["restore", backups[-1].name, "--apply", "--yes"])
+    assert akey not in _read_store(regroup_env.dst_ls)["customGroupAssignments"]
+
+
+def test_regroup_creates_order_when_missing(regroup_env):
+    # destination store lacking customGroupOrder entirely: a minted group must
+    # still be ordered (regression for the setdefault fix).
+    store = {"state": {"customGroups": [{"id": WORK_DST, "name": "Work"}], "customGroupAssignments": {}}, "version": 0}
+    _build_ls(regroup_env.alt, store, seq=50, log_number=7)
+    altpaca.main(["regroup", A[:8], f"excitoon/{B[:8]}", "--apply", "--yes"])
+    st = _read_store(regroup_env.dst_ls)
+    home_id = st["customGroupAssignments"]["code:local_22222222-2222-2222-2222-222222222222"]
+    assert home_id in st["customGroupOrder"]  # created list, new group ordered
+
+
+def test_regroup_refuses_same_tenant(regroup_env):
+    with pytest.raises(SystemExit):
+        altpaca.main(["regroup", A[:8], B[:8], "--apply", "--yes"])  # both in default tenant
+
+
+def test_regroup_refuses_bad_schema_version(regroup_env):
+    ls = regroup_env.dst_ls
+    # poison the VERSION row with an unexpected value
+    bad = altpaca._write_batch(999, b"VERSION", altpaca._encode_ls_value("9"))
+    altpaca._append_log_record(ls / "000007.log", bad)
+    with pytest.raises(SystemExit):
+        altpaca.main(["regroup", A[:8], f"excitoon/{B[:8]}", "--apply", "--yes"])
+
+
+def test_move_with_regroup_end_to_end(env, capsys):
+    """A fresh cross-tenant move --regroup files the moved sessions in one shot."""
+    alt = env.base.parent / "Claude-excitoon"
+    (alt / "claude-code-sessions" / B / WB).mkdir(parents=True)
+    _build_ls(env.base, _src_store(), seq=100, log_number=3)
+    _build_ls(alt, _dst_store(), seq=50, log_number=7)
+    dst_ls = alt / "Local Storage" / "leveldb"
+
+    altpaca.main(["move", A[:8], f"excitoon/{B[:8]}", "--all", "--regroup", "--apply", "--yes", "--force"])
+    # the two grouped sessions are now filed in the destination store
+    asg = _read_store(dst_ls)["customGroupAssignments"]
+    assert "code:local_11111111-1111-1111-1111-111111111111" in asg
+    assert "code:local_22222222-2222-2222-2222-222222222222" in asg

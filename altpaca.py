@@ -17,6 +17,23 @@
 #   after an app restart. Quit Claude before moving — it may flush in-memory state
 #   on exit and clobber changes.
 #
+# TENANTS: several app-data dirs can sit side by side under
+#   ~/Library/Application Support/ — the bare "Claude" (the *default* tenant) plus
+#   "Claude-<suffix>" siblings (e.g. Claude-excitoon). Each tenant has its OWN
+#   claude-code-sessions/<ACCOUNT>/ tree AND its own Local Storage group store, so
+#   account uuids and group ids are unique only *within* a tenant. Accounts are
+#   addressed as "<suffix>/<uuid>" for named tenants and just "<uuid>" for the
+#   default one. Moving a session across tenants relocates the file but does NOT
+#   automatically carry group membership (that lives in per-tenant Local Storage).
+#   The `regroup` command (and `move/copy --regroup`) re-files membership by group
+#   NAME: it recovers each session's source-tenant group name from the source's
+#   still-present dframe-store assignments and writes the matching assignment into
+#   the destination tenant's store, by *appending* one record to its leveldb
+#   write-ahead log. The append is strictly additive (never rewrites existing
+#   bytes), so the worst-case failure of a malformed write is "the record is
+#   ignored / sessions stay ungrouped", not loss of existing Local Storage — and
+#   a backup of the touched .log is taken first. Quit the app before regrouping.
+#
 # Pure stdlib. MIT licensed.
 
 from __future__ import annotations
@@ -28,9 +45,11 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import uuid as _uuidlib
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -64,6 +83,92 @@ def projects_dir() -> Path:
 
 def backup_root() -> Path:
     return Path(os.environ.get("ALTPACA_BACKUP_DIR", str(HOME / ".altpaca" / "backups")))
+
+
+# --------------------------------------------------------------------------- #
+# tenants & accounts
+#
+# A *tenant* is one app-data dir (default "Claude", or a "Claude-<suffix>"
+# sibling). An *account* is a uuid folder under a tenant's claude-code-sessions/.
+# Account refs are "<suffix>/<uuid>" for named tenants, bare "<uuid>" for default.
+# --------------------------------------------------------------------------- #
+class Tenant:
+    def __init__(self, name: str, base):
+        self.name = name  # "" for the default (bare-uuid) tenant
+        self.base = Path(base)
+
+    @property
+    def sessions_root(self) -> Path:
+        return self.base / SESSIONS_DIRNAME
+
+    @property
+    def local_storage(self) -> Path:
+        return self.base / "Local Storage" / "leveldb"
+
+    def __repr__(self):
+        return f"Tenant({self.name or '(default)'!r})"
+
+
+class Account:
+    def __init__(self, tenant: Tenant, uuid: str):
+        self.tenant = tenant
+        self.uuid = uuid
+
+    @property
+    def ref(self) -> str:
+        return f"{self.tenant.name}/{self.uuid}" if self.tenant.name else self.uuid
+
+    @property
+    def short(self) -> str:
+        return f"{self.tenant.name}/{self.uuid[:8]}" if self.tenant.name else self.uuid[:8]
+
+    @property
+    def sessions_dir(self) -> Path:
+        return self.tenant.sessions_root / self.uuid
+
+    def __eq__(self, other):
+        if isinstance(other, Account):
+            return str(self.tenant.base) == str(other.tenant.base) and self.uuid == other.uuid
+        return NotImplemented
+
+    def __hash__(self):
+        return hash((str(self.tenant.base), self.uuid))
+
+    def __repr__(self):
+        return f"Account({self.ref})"
+
+
+def default_tenant() -> Tenant:
+    return Tenant("", base_dir())
+
+
+def discover_tenants() -> list:
+    """The default tenant (base_dir()) plus any sibling 'Claude-<suffix>' dirs.
+
+    The default tenant is always the bare base dir; the named-tenant prefix is
+    always the canonical 'Claude' name, so ALTPACA_CLAUDE_DIR can never promote a
+    'Claude-<suffix>' sibling to be the default or redefine the naming scheme.
+    """
+    pb = base_dir()
+    stem = DEFAULT_BASE.name  # always "Claude" — never derived from the env-pointed dir
+    tenants = [Tenant("", pb)]
+    try:
+        siblings = sorted(pb.parent.iterdir())
+    except Exception:
+        siblings = []
+    for d in siblings:
+        if d == pb:
+            continue  # the default tenant is never also a named one
+        if d.is_dir() and d.name.startswith(stem + "-"):
+            tenants.append(Tenant(d.name[len(stem) + 1 :], d))
+    return tenants
+
+
+def _short_ref(ref: str) -> str:
+    if "/" in ref:
+        t, u = ref.split("/", 1)
+        return f"{t}/{u[:8]}"
+    return ref[:8]
 
 
 # --------------------------------------------------------------------------- #
@@ -173,9 +278,13 @@ def _sstable_entries(path):
             yield from _ldb_block_kvs(block)
 
 
-def _wal_entries(path):
-    with open(path, "rb") as f:
-        data = f.read()
+def _log_record_payloads(data: bytes):
+    """Reassemble physical log records (FULL/FIRST/MIDDLE/LAST) into payloads.
+
+    The leveldb log format (shared by the WAL *and* the MANIFEST) frames data into
+    32 KiB blocks of [crc(4) | len(2) | type(1) | payload] records; this yields the
+    logical payloads with multi-block fragments stitched back together.
+    """
     recs = []
     frag = b""
     off = 0
@@ -199,7 +308,11 @@ def _wal_entries(path):
             elif rtype == 4:
                 recs.append(frag + payload)
                 frag = b""
-    for rec in recs:
+    return recs
+
+
+def _wal_entries(path):
+    for rec in _log_record_payloads(Path(path).read_bytes()):
         if len(rec) < 12:
             continue
         seq = int.from_bytes(rec[0:8], "little")
@@ -240,23 +353,30 @@ def _decode_ls_value(v: bytes) -> str:
     return v.decode("utf-8", "replace")
 
 
-def _read_localstorage_blob(needle: str):
-    """Newest decoded localStorage value containing `needle`, or None."""
-    src = local_storage_dir()
-    if not src.exists():
-        return None
+def _merge_ls(src: Path):
+    """Snapshot a Local Storage leveldb dir and merge it to the current view.
+
+    Returns (merged, max_seq) where merged maps each internal user-key -> (seq,
+    value-bytes or None for a deletion) keeping the highest-sequence record per
+    key (leveldb's last-write-wins), and max_seq is the highest sequence number
+    seen anywhere (across .ldb + .log) — the floor the write path bumps past.
+    The live DB may be locked/mid-write, so we read a copy, never the originals.
+    """
     tmp = Path(tempfile.mkdtemp(prefix="altpaca-ls-"))
     try:
         for f in src.glob("*"):
             try:
-                shutil.copy(f, tmp)  # snapshot; the live DB may be locked/mid-write
+                shutil.copy(f, tmp)
             except Exception:
                 pass
         merged = {}
+        max_seq = 0
         for ldb in sorted(tmp.glob("*.ldb")):
             try:
                 for k, v in _sstable_entries(ldb):
                     uk, seq, typ = _split_internal(k)
+                    if seq > max_seq:
+                        max_seq = seq
                     cur = merged.get(uk)
                     if cur is None or seq > cur[0]:
                         merged[uk] = (seq, None if typ == 0 else v)
@@ -265,20 +385,31 @@ def _read_localstorage_blob(needle: str):
         for log in sorted(tmp.glob("*.log")):
             try:
                 for uk, seq, typ, v in _wal_entries(log):
+                    if seq > max_seq:
+                        max_seq = seq
                     cur = merged.get(uk)
                     if cur is None or seq > cur[0]:
                         merged[uk] = (seq, None if typ == 0 else v)
             except Exception:
                 pass
-        best = None
-        for _uk, (seq, v) in merged.items():
-            if v is not None:
-                text = _decode_ls_value(v)
-                if needle in text and (best is None or seq > best[0]):
-                    best = (seq, text)
-        return best[1] if best else None
+        return merged, max_seq
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _read_localstorage_blob(needle: str, src: Path = None):
+    """Newest decoded localStorage value containing `needle`, or None."""
+    src = src if src is not None else local_storage_dir()
+    if not src.exists():
+        return None
+    merged, _ = _merge_ls(src)
+    best = None
+    for _uk, (seq, v) in merged.items():
+        if v is not None:
+            text = _decode_ls_value(v)
+            if needle in text and (best is None or seq > best[0]):
+                best = (seq, text)
+    return best[1] if best else None
 
 
 def _parse_dframe_groups(text: str):
@@ -295,19 +426,21 @@ def _parse_dframe_groups(text: str):
     return uuid2group, names
 
 
-_NATIVE_CACHE = None
+_NATIVE_CACHE = {}
 
 
-def native_groups():
-    """(uuid -> group name, ordered group names) from the app's Local Storage."""
-    global _NATIVE_CACHE
-    if _NATIVE_CACHE is None:
-        text = _read_localstorage_blob('"customGroups"')
+def native_groups(tenant: Tenant = None):
+    """(uuid -> group name, ordered group names) from a tenant's Local Storage."""
+    if tenant is None:
+        tenant = default_tenant()
+    key = str(tenant.base)
+    if key not in _NATIVE_CACHE:
+        text = _read_localstorage_blob('"customGroups"', tenant.local_storage)
         try:
-            _NATIVE_CACHE = _parse_dframe_groups(text) if text else ({}, [])
+            _NATIVE_CACHE[key] = _parse_dframe_groups(text) if text else ({}, [])
         except Exception:
-            _NATIVE_CACHE = ({}, [])
-    return _NATIVE_CACHE
+            _NATIVE_CACHE[key] = ({}, [])
+    return _NATIVE_CACHE[key]
 
 
 def match_group_name(query, names):
@@ -317,6 +450,252 @@ def match_group_name(query, names):
     if not names:
         die("could not read the app's groups (Local Storage not found or unreadable)")
     die(f"no such group '{query}'. groups: " + ", ".join(names))
+
+
+# --------------------------------------------------------------------------- #
+# native groups (WRITE path). Used only by `regroup`. We never rewrite existing
+# bytes: we APPEND one record to the destination tenant's Local Storage leveldb
+# write-ahead log, carrying an updated `dframe-store` value. leveldb replays the
+# log on next open and last-write-wins makes our value the live one.
+#
+# The on-disk framing is verified against google/leveldb (db/log_format.h,
+# db/log_writer.cc, util/crc32c.h, db/write_batch.cc) and Chromium's DOM Storage
+# value encoding. Safety rests on append-only: a malformed/truncated trailing
+# record is dropped by the reader (resync on the 32 KiB block boundary / EOF),
+# so the worst case is "our record is ignored", never loss of existing data.
+# --------------------------------------------------------------------------- #
+_LDB_BLOCK = 32768
+_LDB_HEADER = 7
+_CRC32C_TABLE = None
+
+
+def _crc32c(data: bytes) -> int:
+    """CRC-32C (Castagnoli, reflected poly 0x82F63B78) — NOT zlib's IEEE CRC32."""
+    global _CRC32C_TABLE
+    if _CRC32C_TABLE is None:
+        tbl = []
+        for i in range(256):
+            c = i
+            for _ in range(8):
+                c = (c >> 1) ^ (0x82F63B78 if c & 1 else 0)
+            tbl.append(c)
+        _CRC32C_TABLE = tbl
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc = (crc >> 8) ^ _CRC32C_TABLE[(crc ^ b) & 0xFF]
+    return crc ^ 0xFFFFFFFF
+
+
+def _mask_crc(c: int) -> int:
+    """leveldb's util/crc32c.h Mask(): rotate then add kMaskDelta."""
+    return (((c >> 15) | (c << 17)) + 0xA282EAD8) & 0xFFFFFFFF
+
+
+def _ldb_varint(n: int) -> bytes:
+    """leveldb base-128 varint (low 7-bit group first; high bit = continuation)."""
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+
+def _encode_ls_value(s: str) -> bytes:
+    """Chromium DOM-Storage value blob: 0x01+Latin-1 if every code unit <= 0xFF,
+    else 0x00+UTF-16LE (matches Blink WTF::String's 8-bit/16-bit choice)."""
+    if all(ord(c) <= 0xFF for c in s):
+        return b"\x01" + s.encode("latin-1")
+    return b"\x00" + s.encode("utf-16-le")
+
+
+def _write_batch(seq: int, key: bytes, value: bytes) -> bytes:
+    """A single-Put WriteBatch payload: fixed64 seq + fixed32 count(=1) + op."""
+    if seq > (1 << 56) - 1:
+        die("computed leveldb sequence is implausibly large; refusing to write")
+    return (
+        struct.pack("<Q", seq)
+        + struct.pack("<I", 1)
+        + b"\x01"  # kTypeValue
+        + _ldb_varint(len(key))
+        + key
+        + _ldb_varint(len(value))
+        + value
+    )
+
+
+def _frame_log_append(payload: bytes, file_size: int) -> bytes:
+    """Frame `payload` into physical log record(s) to append at `file_size`.
+
+    Replicates leveldb log::Writer.AddRecord exactly: it seeds block_offset from
+    the current file length, zero-pads a sub-7-byte block tail, and splits across
+    FULL/FIRST/MIDDLE/LAST fragments on 32 KiB boundaries. A localStorage value is
+    far under one block, so this is virtually always a single FULL record — but the
+    fragmentation path is here so a write that happens to straddle a boundary stays
+    valid rather than being silently rejected by the reader.
+    """
+    out = bytearray()
+    block_offset = file_size % _LDB_BLOCK
+    ptr = 0
+    left = len(payload)
+    begin = True
+    while True:
+        if _LDB_BLOCK - block_offset < _LDB_HEADER:
+            out += b"\x00" * (_LDB_BLOCK - block_offset)  # zero trailer; reader skips it
+            block_offset = 0
+        # When exactly _LDB_HEADER bytes remain, avail==0 and leveldb emits a
+        # zero-length FIRST record to consume the tail, spilling the payload into
+        # the next block (doc/log_format.md). We match that on purpose — it is NOT
+        # a bug to "pad away"; diverging here would stop matching leveldb's writer.
+        avail = _LDB_BLOCK - block_offset - _LDB_HEADER
+        frag = min(left, avail)
+        end = frag == left
+        rtype = 1 if (begin and end) else 2 if begin else 4 if end else 3
+        chunk = payload[ptr : ptr + frag]
+        crc = _mask_crc(_crc32c(bytes([rtype]) + chunk))
+        out += struct.pack("<IHB", crc, frag, rtype) + chunk
+        block_offset += _LDB_HEADER + frag
+        ptr += frag
+        left -= frag
+        begin = False
+        if left == 0:
+            return bytes(out)
+
+
+def _append_log_record(log_path: Path, payload: bytes):
+    """Strictly append one WriteBatch to the end of an existing .log (fsync'd)."""
+    with open(log_path, "r+b") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.write(_frame_log_append(payload, size))
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _parse_version_edit(rec: bytes) -> dict:
+    """Decode the tags we need from a leveldb MANIFEST VersionEdit record.
+
+    Returns {tag: int} for log_number (2), next_file (3), last_sequence (4),
+    prev_log_number (9). Other tags are skipped by walking their payloads.
+    """
+    out = {}
+    p = 0
+    n = len(rec)
+    try:
+        while p < n:
+            tag, p = _uvarint(rec, p)
+            if tag in (2, 3, 4, 9):  # varint scalars we care about
+                val, p = _uvarint(rec, p)
+                out[tag] = val
+            elif tag == 1:  # comparator: length-prefixed string
+                ln, p = _uvarint(rec, p)
+                p += ln
+            elif tag == 5:  # compact pointer: level + length-prefixed key
+                _, p = _uvarint(rec, p)
+                ln, p = _uvarint(rec, p)
+                p += ln
+            elif tag == 6:  # deleted file: level + file number
+                _, p = _uvarint(rec, p)
+                _, p = _uvarint(rec, p)
+            elif tag == 7:  # new file: level + number + size + smallest + largest
+                _, p = _uvarint(rec, p)
+                _, p = _uvarint(rec, p)
+                _, p = _uvarint(rec, p)
+                ln, p = _uvarint(rec, p)
+                p += ln
+                ln, p = _uvarint(rec, p)
+                p += ln
+            else:  # unknown tag — can't safely keep walking
+                break
+    except Exception:
+        pass
+    return out
+
+
+def _ldb_active_log(ls_dir: Path):
+    """(active .log path, last-sequence floor) from CURRENT -> MANIFEST.
+
+    The active log is the one referenced by the manifest's log_number; appending
+    to any other .log is harmless but ineffective (leveldb won't replay it). Falls
+    back to (None, 0) if the manifest can't be read so the caller can use the
+    highest-numbered .log instead.
+    """
+    current = ls_dir / "CURRENT"
+    if not current.exists():
+        return None, 0
+    try:
+        man_name = current.read_text().strip()
+    except Exception:
+        return None, 0
+    manifest = ls_dir / man_name
+    if not manifest.exists():
+        return None, 0
+    log_number = None
+    last_seq = 0
+    try:
+        for rec in _log_record_payloads(manifest.read_bytes()):
+            edit = _parse_version_edit(rec)
+            if 2 in edit:
+                log_number = edit[2]
+            if 4 in edit:
+                last_seq = max(last_seq, edit[4])
+    except Exception:
+        return None, 0
+    log_path = None
+    if log_number is not None:
+        cand = ls_dir / f"{log_number:06d}.log"
+        if cand.exists():
+            log_path = cand
+    return log_path, last_seq
+
+
+def _dframe_record(merged):
+    """(internal key bytes, parsed store dict) for the newest dframe-store record.
+
+    Returns the VERBATIM on-disk key bytes (reused unchanged on write so we never
+    have to reconstruct Chromium's key framing) and the whole `{state, version}`
+    store object. (None, None) if there is no group store.
+    """
+    best = None
+    for uk, (seq, v) in merged.items():
+        if v is not None:
+            text = _decode_ls_value(v)
+            if '"customGroups"' in text and (best is None or seq > best[0]):
+                best = (seq, uk, text)
+    if not best:
+        return None, None
+    try:
+        return best[1], json.loads(best[2])
+    except Exception:
+        return None, None
+
+
+def _store_state(store: dict) -> dict:
+    return store.get("state", store)
+
+
+def recover_source_group_names(src_ls: Path) -> dict:
+    """uuid -> source group NAME, from the source tenant's dframe-store.
+
+    A cross-tenant move removes the session *file* from the source but leaves its
+    `customGroupAssignments` row intact, so this recovers the group each moved
+    session belonged to even after the move.
+    """
+    if not src_ls.exists():
+        return {}
+    merged, _ = _merge_ls(src_ls)
+    _key, store = _dframe_record(merged)
+    if not store:
+        return {}
+    st = _store_state(store)
+    id2name = {g["id"]: g["name"] for g in st.get("customGroups", [])}
+    out = {}
+    for k, gid in st.get("customGroupAssignments", {}).items():
+        u = k.split("local_", 1)[-1] if "local_" in k else k.rsplit(":", 1)[-1]
+        if gid in id2name:
+            out[u] = id2name[gid]
+    return out
 
 
 def die(msg: str, code: int = 1):
@@ -386,8 +765,9 @@ class Progress:
 # model
 # --------------------------------------------------------------------------- #
 class Session:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, tenant: Tenant = None):
         self.path = Path(path)
+        self.tenant = tenant
         self.workspace = self.path.parent.name
         self.account = self.path.parent.parent.name
         try:
@@ -395,6 +775,20 @@ class Session:
         except Exception as e:  # keep going; surface a warning
             self.meta = {}
             warn(f"could not parse {self.path.name}: {e}")
+
+    @property
+    def tenant_name(self) -> str:
+        return self.tenant.name if self.tenant else ""
+
+    @property
+    def account_ref(self) -> str:
+        if self.tenant and self.tenant.name:
+            return f"{self.tenant.name}/{self.account}"
+        return self.account
+
+    @property
+    def account_obj(self) -> Account:
+        return Account(self.tenant or default_tenant(), self.account)
 
     @property
     def session_id(self) -> str:
@@ -445,36 +839,50 @@ class Session:
         )
 
 
+def all_account_objs() -> list:
+    out = []
+    for t in discover_tenants():
+        root = t.sessions_root
+        if not root.exists():
+            continue
+        for p in sorted(root.iterdir()):
+            if p.is_dir():
+                out.append(Account(t, p.name))
+    out.sort(key=lambda a: a.ref)
+    return out
+
+
 def all_accounts() -> list:
-    root = sessions_root()
-    if not root.exists():
-        return []
-    return sorted(p.name for p in root.iterdir() if p.is_dir())
+    return [a.ref for a in all_account_objs()]
 
 
-def workspaces_of(account: str) -> list:
-    accdir = sessions_root() / account
+def workspaces_of(account: Account) -> list:
+    accdir = account.sessions_dir
     if not accdir.exists():
         return []
     return sorted(p.name for p in accdir.iterdir() if p.is_dir())
 
 
 def discover() -> list:
-    root = sessions_root()
-    if not root.exists():
-        die(f"sessions dir not found: {root}\nis the Claude desktop app installed? set ALTPACA_CLAUDE_DIR to override.")
+    tenants = [t for t in discover_tenants() if t.sessions_root.exists()]
+    if not tenants:
+        die(
+            f"sessions dir not found: {sessions_root()}\n"
+            "is the Claude desktop app installed? set ALTPACA_CLAUDE_DIR to override."
+        )
     out = []
-    for acc in sorted(p for p in root.iterdir() if p.is_dir()):
-        for ws in sorted(p for p in acc.iterdir() if p.is_dir()):
-            for f in sorted(ws.glob("local_*.json")):
-                out.append(Session(f))
+    for t in tenants:
+        for acc in sorted(p for p in t.sessions_root.iterdir() if p.is_dir()):
+            for ws in sorted(p for p in acc.iterdir() if p.is_dir()):
+                for f in sorted(ws.glob("local_*.json")):
+                    out.append(Session(f, tenant=t))
     return out
 
 
 def by_account(sessions: list) -> dict:
     d = {}
     for s in sessions:
-        d.setdefault(s.account, []).append(s)
+        d.setdefault(s.account_ref, []).append(s)
     return d
 
 
@@ -483,24 +891,46 @@ def current_account(sessions: list):
     if env_sid:
         for s in sessions:
             if s.cli_id == env_sid or s.uuid == env_sid:
-                return s.account
+                return s.account_obj
     best, acc = -1, None
     for s in sessions:
         if s.last_activity > best:
-            best, acc = s.last_activity, s.account
+            best, acc = s.last_activity, s.account_obj
     return acc
 
 
-def resolve_account(ref: str) -> str:
-    accs = all_accounts()
-    if not accs:
-        die("no account partitions found")
-    m = [a for a in accs if a == ref or a.startswith(ref)]
-    if not m:
-        die(f"no account matches '{ref}'. known: " + ", ".join(a[:8] for a in accs))
-    if len(m) > 1:
-        die(f"'{ref}' is ambiguous: " + ", ".join(x[:8] for x in m))
-    return m[0]
+def resolve_account(ref: str) -> Account:
+    """Resolve '<tenant>/<uuid>' (or bare '<uuid>' for the default tenant) to an Account.
+
+    Tenant name and uuid both accept a prefix; bare refs only ever match the
+    default tenant, so the same uuid living in two tenants stays unambiguous.
+    """
+    if "/" in ref:
+        tname, uref = ref.split("/", 1)
+    else:
+        tname, uref = "", ref
+    tenants = discover_tenants()
+    if tname == "":
+        cand_t = [t for t in tenants if t.name == ""]
+    else:
+        exact = [t for t in tenants if t.name == tname]
+        cand_t = exact or [t for t in tenants if t.name.startswith(tname)]
+    matches = []
+    for t in cand_t:
+        root = t.sessions_root
+        if not root.exists():
+            continue
+        for p in sorted(root.iterdir()):
+            if p.is_dir() and (p.name == uref or p.name.startswith(uref)):
+                matches.append(Account(t, p.name))
+    if not matches:
+        known = all_accounts()
+        if not known:
+            die("no account partitions found")
+        die(f"no account matches '{ref}'. known: " + ", ".join(_short_ref(a) for a in known))
+    if len(matches) > 1:
+        die(f"'{ref}' is ambiguous: " + ", ".join(a.short for a in matches))
+    return matches[0]
 
 
 def select(sessions: list, args) -> list:
@@ -513,8 +943,10 @@ def select(sessions: list, args) -> list:
     if getattr(args, "title", None):
         t = args.title.lower()
         out = [s for s in out if t in s.title.lower()]
-    if getattr(args, "group", None):
-        uuid2group, names = native_groups()
+    if getattr(args, "group", None) and out:
+        # callers pass single-account (so single-tenant) slices; resolve the
+        # group name within that tenant's own Local Storage.
+        uuid2group, names = native_groups(out[0].tenant)
         target = match_group_name(args.group, names)
         out = [s for s in out if uuid2group.get(s.uuid) == target]
     if getattr(args, "skip_archived", False):
@@ -558,45 +990,50 @@ def cmd_accounts(args):
     sessions = discover()
     groups = by_account(sessions)
     cur = current_account(sessions)
-    if not all_accounts():
+    accts = all_account_objs()
+    if not accts:
         print("no account partitions found.")
         return
-    print(f"Claude session partitions under {sessions_root()}\n")
-    for acc in all_accounts():
-        ss = groups.get(acc, [])
+    tenants = discover_tenants()
+    print(f"Claude session partitions across {len(tenants)} tenant(s):")
+    for t in tenants:
+        print(f"  {t.name or '(default)':12}  {t.base}")
+    print()
+    for acc in accts:
+        ss = groups.get(acc.ref, [])
         arch = sum(1 for s in ss if s.archived)
         projs = len({s.cwd for s in ss})
         wss = workspaces_of(acc)
-        mark = "  <- current login (guess)" if acc == cur else ""
-        print(f"{acc}")
+        mark = "  <- current login (guess)" if (cur is not None and acc == cur) else ""
+        print(f"{acc.ref}")
         print(f"  sessions={len(ss)}  archived={arch}  projects={projs}  workspaces={len(wss)}{mark}")
         newest = max(ss, key=lambda s: s.last_activity, default=None)
         if newest:
             print(f"  newest: {fmt_ts(newest.last_activity)}  {newest.title[:54]}")
         print()
-    print("Pick source/destination by the uuid (a prefix like the first 8 chars is fine):")
+    print("Pick source/destination by the account ref ('<uuid>', or '<tenant>/<uuid>'; prefixes ok):")
     print("  altpaca list <account>")
     print("  altpaca move <src> <dst> --all          # dry-run by default")
 
 
 def cmd_list(args):
     sessions = discover()
-    uuid2group, _names = native_groups()
-    show_group = bool(uuid2group)
-    accounts = [resolve_account(args.account)] if args.account else all_accounts()
+    accounts = [resolve_account(args.account)] if args.account else all_account_objs()
     if not accounts:
         print("no accounts found.")
         return
     cur = current_account(sessions)
     total = 0
     for i, acc in enumerate(accounts):
-        ss = [s for s in sessions if s.account == acc]
+        ss = [s for s in sessions if s.account_ref == acc.ref]
         if has_positive_selector(args) or args.skip_archived:
             ss = select(ss, args)
+        uuid2group, _names = native_groups(acc.tenant)
+        show_group = bool(uuid2group)
         mark = "  <- current login (guess)" if (not args.account and acc == cur) else ""
         if i:
             print()
-        print(f"account {acc}  ({len(ss)} session(s)){mark}")
+        print(f"account {acc.ref}  ({len(ss)} session(s)){mark}")
         hdr = [f"{'uuid':8}", f"{'first activity':16}", f"{'last activity':16}", " "]
         if show_group:
             hdr.append(f"{'group':12}")
@@ -646,19 +1083,19 @@ def _read_transcript(path: Path) -> list:
 
 def cmd_dump(args):
     acc = resolve_account(args.account)
-    ss = [s for s in discover() if s.account == acc]
+    ss = [s for s in discover() if s.account_ref == acc.ref]
     if not ss:
         die("no sessions in that account")
 
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    default_name = f"altpaca-dump_{acc[:8]}_{run_stamp}.zip"
+    default_name = f"altpaca-dump_{acc.uuid[:8]}_{run_stamp}.zip"
     if args.out:
         o = Path(args.out).expanduser()
         archive = o if o.suffix == ".zip" else o / default_name
     else:
         archive = HOME / ".altpaca" / "dumps" / default_name
     archive = _unique_path(archive)
-    print(f"dumping {len(ss)} session(s) from {acc[:8]} -> {archive}")
+    print(f"dumping {len(ss)} session(s) from {acc.short} -> {archive}")
     if args.dry_run:
         for s in ss:
             print(f"  would add {_entry_name(s)}")
@@ -676,7 +1113,8 @@ def cmd_dump(args):
             bundle = {
                 "altpaca_dump": 1,
                 "exported_at": datetime.now().isoformat(timespec="seconds"),
-                "source_account": acc,
+                "source_account": acc.ref,
+                "source_tenant": acc.tenant.name or "(default)",
                 "source_workspace": s.workspace,
                 "session_file": s.path.name,
                 "metadata": s.meta,
@@ -735,6 +1173,155 @@ def make_backup(originals: list, dests: list) -> Path:
     return archive
 
 
+def regroup(src_tenant, dst_tenant, candidates, *, apply, force, no_backup, yes, header=True):
+    """Re-file `candidates` (sessions now in dst_tenant) into dst_tenant's groups
+    by matching each session's source-tenant group NAME, writing the result by
+    appending one record to the destination's Local Storage leveldb.
+
+    Returns the number of sessions regrouped (0 on a dry-run). The Claude desktop
+    app must be quit — it owns the destination's Local Storage.
+    """
+    if str(src_tenant.base) == str(dst_tenant.base):
+        die("regroup needs two different tenants (within-tenant moves keep grouping)")
+    dst_ls = dst_tenant.local_storage
+    if not dst_ls.exists():
+        die(f"destination tenant has no Local Storage at {dst_ls}")
+
+    uuid2name = recover_source_group_names(src_tenant.local_storage)
+    if not uuid2name:
+        die("no group assignments are recoverable from the source tenant's Local Storage")
+
+    dst_merged, dst_max = _merge_ls(dst_ls)
+    ver = next(
+        (_decode_ls_value(v) for uk, (sq, v) in dst_merged.items() if v is not None and uk == b"VERSION"),
+        None,
+    )
+    if ver is not None and ver != "1":
+        die(
+            f"destination Local Storage schema version is {ver!r}, expected '1' — refusing to write "
+            "(the layout may have changed)"
+        )
+    dst_key, dst_store = _dframe_record(dst_merged)
+    if dst_store is None or dst_key is None:
+        die("destination tenant has no group store yet — open the app once on that tenant first")
+    st = _store_state(dst_store)
+    assign = st.setdefault("customGroupAssignments", {})
+    groups = st.setdefault("customGroups", [])
+    order = st.setdefault("customGroupOrder", [])  # so a freshly minted group is also ordered
+    name2id = {g["name"]: g["id"] for g in groups}
+    id2name = {g["id"]: g["name"] for g in groups}
+
+    plan, skipped = [], []
+    for s in candidates:
+        name = uuid2name.get(s.uuid)
+        if not name:
+            skipped.append((s, "no group at source"))
+            continue
+        akey = f"code:local_{s.uuid}"
+        if akey in assign and not force:
+            skipped.append((s, f"already in '{id2name.get(assign[akey], '?')}' (use --force to override)"))
+            continue
+        plan.append((s, name))
+
+    if header:
+        print(f"REGROUP  {src_tenant.name or 'default'}  ->  {dst_tenant.name or 'default'}")
+    print(f"{len(plan)} session(s) to regroup by group name:")
+    bygroup = {}
+    for s, name in plan:
+        bygroup.setdefault(name, []).append(s)
+    for name in sorted(bygroup):
+        tag = "" if name in name2id else "  [new group — will be created]"
+        print(f"  {name}  ({len(bygroup[name])}){tag}")
+        for s in sorted(bygroup[name], key=lambda x: x.last_activity, reverse=True):
+            base = os.path.basename(s.cwd.rstrip("/")) or s.cwd or "?"
+            print(f"      {s.uuid[:8]}  {base[:18]:18}  {s.title[:42]}")
+    if skipped:
+        print(f"\nskipping {len(skipped)}:")
+        for s, why in skipped[:40]:
+            print(f"  {s.uuid[:8]}  {why}")
+        if len(skipped) > 40:
+            print(f"  ... and {len(skipped) - 40} more")
+
+    if not plan:
+        die("nothing to regroup")
+
+    if not apply:
+        print(
+            f"\nDRY-RUN — nothing changed. Re-run with --apply to write group membership into "
+            f"{dst_tenant.name or 'default'}'s Local Storage. (add --yes to skip the prompt)"
+        )
+        return 0
+
+    if claude_running() and not force:
+        die(
+            "the Claude desktop app is running — quit it first (it owns this Local Storage and can "
+            "clobber the write), then retry. use --force to override."
+        )
+
+    if not yes:
+        if not sys.stdin.isatty():
+            die("refusing to apply without confirmation; pass --yes")
+        prompt = f"\nProceed to regroup {len(plan)} session(s) in {dst_tenant.name or 'default'}? [y/N] "
+        if input(prompt).strip().lower() not in ("y", "yes"):
+            die("aborted")
+        if claude_running() and not force:  # re-check: the app may have started during the prompt
+            die("the Claude desktop app started while waiting — quit it and retry (it can clobber the write).")
+
+    active_log, man_seq = _ldb_active_log(dst_ls)
+    if active_log is None:
+        logs = sorted(dst_ls.glob("*.log"))
+        if not logs:
+            die("no .log file in the destination's Local Storage; cannot append a write")
+        active_log = max(logs, key=lambda p: p.name)
+        warn(f"could not read MANIFEST; appending to highest-numbered log {active_log.name}")
+    new_seq = max(dst_max, man_seq) + 1
+
+    backup_dir = None
+    if not no_backup:
+        backup_dir = make_backup([active_log], [])
+        print(f"backup: {backup_dir}")
+
+    for s, name in plan:
+        gid = name2id.get(name)
+        if gid is None:  # name absent in destination — mint a fresh group
+            gid = "cg-" + str(_uuidlib.uuid4())
+            groups.append({"id": gid, "name": name})
+            if isinstance(order, list):
+                order.append(gid)
+            name2id[name] = gid
+        assign[f"code:local_{s.uuid}"] = gid
+
+    new_text = json.dumps(dst_store, ensure_ascii=False, separators=(",", ":"))
+    payload = _write_batch(new_seq, dst_key, _encode_ls_value(new_text))
+    _append_log_record(active_log, payload)
+
+    print(f"\nregrouped {len(plan)} session(s) in {dst_tenant.name or 'default'}.")
+    print("restart the Claude desktop app to see them filed under their groups.")
+    if backup_dir:
+        print(f"undo the grouping with:  altpaca restore {backup_dir.name}")
+    return len(plan)
+
+
+def cmd_regroup(args):
+    src = resolve_account(args.src)
+    dst = resolve_account(args.dst)
+    if str(src.tenant.base) == str(dst.tenant.base):
+        die("source and destination are in the same tenant — within-tenant grouping is preserved automatically")
+    dst_base = str(dst.tenant.base)
+    candidates = [s for s in discover() if str((s.tenant or default_tenant()).base) == dst_base]
+    if not candidates:
+        die(f"no sessions found in the destination tenant {dst.tenant.name or 'default'}")
+    regroup(
+        src.tenant,
+        dst.tenant,
+        candidates,
+        apply=args.apply,
+        force=args.force,
+        no_backup=args.no_backup,
+        yes=args.yes,
+    )
+
+
 def transfer(args, remove_source: bool):
     verb = "move" if remove_source else "copy"
     src = resolve_account(args.src)
@@ -742,8 +1329,25 @@ def transfer(args, remove_source: bool):
     if src == dst:
         die("source and destination are the same account")
 
+    cross_tenant = str(src.tenant.base) != str(dst.tenant.base)
+    regrouping = cross_tenant and getattr(args, "regroup", False)
+    if cross_tenant:
+        tlabel = f"{src.tenant.name or 'default'} -> {dst.tenant.name or 'default'}"
+        if regrouping:
+            warn(
+                f"cross-tenant {verb} ({tlabel}): after the {verb}, group membership will be re-filed "
+                f"by group NAME in the destination's Local Storage (--regroup)."
+            )
+        else:
+            warn(
+                f"cross-tenant {verb} ({tlabel}): session files move, but sidebar GROUP membership will "
+                "NOT carry — groups live in each tenant's own Local Storage. Pass --regroup to re-file it "
+                "by group name (or run `altpaca regroup <src> <dst>` afterward); otherwise sessions land "
+                "ungrouped."
+            )
+
     sessions = discover()
-    src_ss = [s for s in sessions if s.account == src]
+    src_ss = [s for s in sessions if s.account_ref == src.ref]
 
     if has_positive_selector(args):
         chosen = select(src_ss, args)
@@ -759,24 +1363,24 @@ def transfer(args, remove_source: bool):
     wss = workspaces_of(dst)
     if not wss:
         die(
-            f"destination account {dst[:8]} has no workspace yet.\n"
+            f"destination account {dst.short} has no workspace yet.\n"
             "open the Claude app once while logged into that account to initialize it, then retry."
         )
     if args.workspace:
         cand = [w for w in wss if w == args.workspace or w.startswith(args.workspace)]
         if not cand:
-            die(f"workspace '{args.workspace}' not in {dst[:8]}: " + ", ".join(w[:8] for w in wss))
+            die(f"workspace '{args.workspace}' not in {dst.short}: " + ", ".join(w[:8] for w in wss))
         target_ws = cand[0]
     elif len(wss) == 1:
         target_ws = wss[0]
     else:
         recent = {}
-        for s in (x for x in sessions if x.account == dst):
+        for s in (x for x in sessions if x.account_ref == dst.ref):
             recent[s.workspace] = max(recent.get(s.workspace, 0), s.last_activity)
         target_ws = max(wss, key=lambda w: recent.get(w, 0))
         warn(f"destination has {len(wss)} workspaces; using most-recent {target_ws[:8]} (override with --workspace)")
 
-    dst_dir = sessions_root() / dst / target_ws
+    dst_dir = dst.sessions_dir / target_ws
     env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
 
     plan, skipped = [], []
@@ -793,7 +1397,7 @@ def transfer(args, remove_source: bool):
             continue
         plan.append((s, dest))
 
-    print(f"{verb.upper()}  {src[:8]}  ->  {dst[:8]} / {target_ws[:8]}")
+    print(f"{verb.upper()}  {src.short}  ->  {dst.short} / {target_ws[:8]}")
     print(f"{len(plan)} session(s) to {verb}:")
     print_session_rows([s for s, _ in plan])
     if skipped:
@@ -805,6 +1409,11 @@ def transfer(args, remove_source: bool):
         die("nothing to do")
 
     if not args.apply:
+        if regrouping:
+            print(
+                f"(--regroup) would then re-file up to {len(plan)} moved session(s) "
+                f"by group name in {dst.tenant.name or 'default'}."
+            )
         print(f"\nDRY-RUN — nothing changed. Re-run with --apply to {verb}. (add --yes to skip the prompt)")
         return
 
@@ -835,10 +1444,23 @@ def transfer(args, remove_source: bool):
             s.path.unlink()
         done += 1
 
-    print(f"\n{verb}d {done} session(s) into {dst[:8]} / {target_ws[:8]}.")
+    print(f"\n{verb}d {done} session(s) into {dst.short} / {target_ws[:8]}.")
     print("restart the Claude desktop app to see them under that account.")
     if backup_dir:
         print(f"undo with:  altpaca restore {backup_dir.name}")
+
+    if regrouping:
+        print()
+        regroup(
+            src.tenant,
+            dst.tenant,
+            [s for s, _ in plan],
+            apply=True,
+            force=args.force,
+            no_backup=args.no_backup,
+            yes=True,  # the move itself was already confirmed above
+            header=True,
+        )
 
 
 def cmd_move(args):
@@ -884,6 +1506,8 @@ def cmd_restore(args):
                 die("refusing to apply without confirmation; pass --yes")
             if input("Proceed to restore? [y/N] ").strip().lower() not in ("y", "yes"):
                 die("aborted")
+            if claude_running() and not args.force:  # re-check after the prompt (it owns Local Storage)
+                die("the Claude desktop app started while waiting — quit it and retry.")
 
         for p in created:
             if p.exists():
@@ -897,38 +1521,50 @@ def cmd_restore(args):
 
 def cmd_doctor(args):
     print(f"base dir         : {base_dir()}  ({'ok' if base_dir().exists() else 'MISSING'})")
-    print(f"sessions root    : {sessions_root()}  ({'ok' if sessions_root().exists() else 'MISSING'})")
+    tenants = discover_tenants()
+    print(f"tenants          : {len(tenants)}")
+    for t in tenants:
+        sr = t.sessions_root
+        print(f"  {t.name or '(default)':12}  {t.base}  (sessions-root {'ok' if sr.exists() else 'MISSING'})")
     pj = projects_dir()
     print(f"projects dir     : {pj}  ({'ok' if pj.exists() else 'MISSING'})")
     print(f"backup root      : {backup_root()}")
     print(f"Claude running   : {'yes (quit before moving)' if claude_running() else 'no'}")
     print(f"env session id   : {os.environ.get('CLAUDE_CODE_SESSION_ID', '(unset)')}")
-    if sessions_root().exists():
-        accs = all_accounts()
-        print(f"accounts         : {len(accs)}")
-        for a in accs:
-            print(f"  {a}  workspaces={len(workspaces_of(a))}")
+    accts = all_account_objs()
+    print(f"accounts         : {len(accts)}")
+    for a in accts:
+        print(f"  {a.ref}  workspaces={len(workspaces_of(a))}")
 
 
 def cmd_groups(args):
-    uuid2group, names = native_groups()
-    if not names:
+    sessions = discover()
+    any_groups = False
+    for t in discover_tenants():
+        uuid2group, names = native_groups(t)
+        if not names:
+            continue
+        if any_groups:
+            print()
+        any_groups = True
+        if t.name:  # header only for named tenants; default stays bare
+            print(f"=== tenant {t.name} ===")
+        index = {s.uuid: s for s in sessions if str((s.tenant or default_tenant()).base) == str(t.base)}
+        members = {n: [] for n in names}
+        for uuid, gname in uuid2group.items():
+            if uuid in index:
+                members.setdefault(gname, []).append(index[uuid])
+        for name in names:
+            present = members.get(name, [])
+            print(f"{name}  ({len(present)} session(s) present)")
+            for s in sorted(present, key=lambda x: x.last_activity, reverse=True):
+                base = os.path.basename(s.cwd.rstrip("/")) or s.cwd or "?"
+                print(f"  {s.uuid[:8]}  {base[:18]:18}  {s.title[:50]}")
+        ungrouped = [s for s in index.values() if s.uuid not in uuid2group]
+        if ungrouped:
+            print(f"\nUngrouped: {len(ungrouped)} session(s) present")
+    if not any_groups:
         print("no app groups found (could not read Local Storage, or none defined).")
-        return
-    index = {s.uuid: s for s in discover()}
-    members = {n: [] for n in names}
-    for uuid, gname in uuid2group.items():
-        if uuid in index:
-            members.setdefault(gname, []).append(index[uuid])
-    for name in names:
-        present = members.get(name, [])
-        print(f"{name}  ({len(present)} session(s) present)")
-        for s in sorted(present, key=lambda x: x.last_activity, reverse=True):
-            base = os.path.basename(s.cwd.rstrip("/")) or s.cwd or "?"
-            print(f"  {s.uuid[:8]}  {base[:18]:18}  {s.title[:50]}")
-    ungrouped = [s for s in index.values() if s.uuid not in uuid2group]
-    if ungrouped:
-        print(f"\nUngrouped: {len(ungrouped)} session(s) present")
 
 
 # --------------------------------------------------------------------------- #
@@ -954,12 +1590,12 @@ def build_parser():
     sp.set_defaults(func=cmd_accounts)
 
     sp = sub.add_parser("list", help="list sessions (all accounts if none given)")
-    sp.add_argument("account", nargs="?", help="account uuid (prefix ok; omit to list every account)")
+    sp.add_argument("account", nargs="?", help="account ref '<uuid>' or '<tenant>/<uuid>' (prefix ok; omit for all)")
     add_selectors(sp)
     sp.set_defaults(func=cmd_list)
 
     sp = sub.add_parser("dump", help="archive a whole account's sessions into one .zip (metadata + transcripts)")
-    sp.add_argument("account", help="account uuid (prefix ok) — the entire account is archived")
+    sp.add_argument("account", help="account ref '<uuid>' or '<tenant>/<uuid>' (prefix ok) — whole account archived")
     sp.add_argument("--out", metavar="PATH", help="output dir, or a .zip path (default ~/.altpaca/dumps)")
     sp.add_argument("-n", "--dry-run", action="store_true", help="show the archive contents without writing")
     sp.set_defaults(func=cmd_dump)
@@ -972,15 +1608,37 @@ def build_parser():
         ("copy", "copy sessions to another account (keeps source)", False),
     ):
         sp = sub.add_parser(name, help=helptext)
-        sp.add_argument("src", help="source account uuid (prefix ok)")
-        sp.add_argument("dst", help="destination account uuid (prefix ok)")
+        sp.add_argument("src", help="source account ref '<uuid>' or '<tenant>/<uuid>' (prefix ok)")
+        sp.add_argument("dst", help="destination account ref '<uuid>' or '<tenant>/<uuid>' (prefix ok)")
         add_selectors(sp)
         sp.add_argument("--workspace", help="destination workspace uuid (if the account has several)")
         sp.add_argument("--apply", action="store_true", help="actually perform it (default: dry-run)")
         sp.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
         sp.add_argument("--no-backup", action="store_true", help="do not back up before mutating")
         sp.add_argument("--force", action="store_true", help="proceed despite warnings")
+        sp.add_argument(
+            "--regroup",
+            action="store_true",
+            help="on a cross-tenant move/copy, also re-file sidebar group membership by group name "
+            "in the destination (writes its Local Storage; see the `regroup` command)",
+        )
         sp.set_defaults(func=cmd_move if remove else cmd_copy)
+
+    sp = sub.add_parser(
+        "regroup",
+        help="re-file sidebar group membership across tenants by group name (writes the destination's Local Storage)",
+    )
+    sp.add_argument("src", help="source account ref — the tenant whose grouping to recover from (prefix ok)")
+    sp.add_argument("dst", help="destination account ref — its tenant's Local Storage gets the assignments (prefix ok)")
+    sp.add_argument("--apply", action="store_true", help="actually write it (default: dry-run)")
+    sp.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    sp.add_argument("--no-backup", action="store_true", help="do not back up the touched .log first")
+    sp.add_argument(
+        "--force",
+        action="store_true",
+        help="proceed despite warnings; also override sessions already grouped in the destination",
+    )
+    sp.set_defaults(func=cmd_regroup)
 
     sp = sub.add_parser("restore", help="undo a previous move/copy from its backup")
     sp.add_argument("backup", help="backup archive name/path (or its timestamp) under ~/.altpaca/backups")
