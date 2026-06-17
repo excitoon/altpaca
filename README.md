@@ -49,7 +49,7 @@ pipx install .        # or: pip install --user .
 ## Usage
 
 ```bash
-# see your account partitions and where your sessions actually are
+# see your account partitions, the email signed into each, and where your sessions are
 altpaca accounts
 
 # list sessions in an account (uuid prefix is fine)
@@ -68,6 +68,11 @@ altpaca move aaaaaaaa bbbbbbbb --session 11111111 22222222
 # copy instead of move (keep the originals in the source account)
 altpaca copy aaaaaaaa bbbbbbbb --all
 
+# drop (delete) sessions from an account — DRY RUN by default, backed up so you can restore
+altpaca drop aaaaaaaa --all                          # preview
+altpaca drop aaaaaaaa --project my-project --apply   # delete the metadata (transcript kept)
+altpaca drop aaaaaaaa --session 11111111 --apply --with-transcript  # also delete the transcript
+
 # archive a WHOLE account into ONE .zip (one per run — never overwrites)
 altpaca dump aaaaaaaa                              # -> ~/.altpaca/dumps/altpaca-dump_*.zip
 altpaca dump aaaaaaaa --out ~/backups/             # archive into another dir
@@ -80,10 +85,9 @@ altpaca move aaaaaaaa bbbbbbbb --group Travel       # move a whole group at once
 
 # tenants — a sibling "Claude-<suffix>" app-data dir is a second tenant (see below)
 altpaca list excitoon/9cc54b3d                      # address a named tenant's account
-altpaca move excitoon/9cc54b3d aaaaaaaa --all       # move across tenants (groups don't carry by default)
-altpaca move excitoon/9cc54b3d aaaaaaaa --all --regroup  # ...and re-file group membership by name
+altpaca move excitoon/9cc54b3d aaaaaaaa --all       # cross-tenant move — group membership carried automatically
 
-# regroup — re-file sidebar group membership across tenants by group NAME
+# regroup — re-file sidebar group membership across tenants by group NAME (also runs automatically on a move)
 altpaca regroup aaaaaaaa excitoon/9cc54b3d          # dry-run: show what would be (re)grouped
 altpaca regroup aaaaaaaa excitoon/9cc54b3d --apply  # write it (backs up first; quit the app)
 
@@ -96,16 +100,20 @@ altpaca doctor
 
 ## Safety
 
-- **Dry-run by default.** `move`/`copy` only print a plan unless you pass `--apply`.
-- **Backups.** Every applied move/copy snapshots the affected files into a single
-  `~/.altpaca/backups/altpaca-backup_<timestamp>.zip`; `altpaca restore <name>` reverts it.
+- **Dry-run by default.** `move`/`copy`/`drop` only print a plan unless you pass `--apply`.
+- **Backups.** Every applied move/copy/drop snapshots the affected files into a single
+  `~/.altpaca/backups/altpaca-backup_<timestamp>.zip`; `altpaca restore <name>` reverts it
+  (a dropped session — and its transcript, if you deleted that too — comes right back).
 - **Verify before delete.** A move copies, sha256-checks the copy, *then* removes the
   source.
 - **Won't fight the app.** Refuses to apply while Claude is running.
 - **No transcript, no move.** Sessions whose transcript is missing are skipped
   (override with `--force`).
-- `move`/`copy` only ever touch `local_*.json` metadata files; never your transcripts. (The
-  separate `regroup` command also writes the destination's Local Storage — see **Regrouping**.)
+- `move`/`copy`/`drop` only ever touch `local_*.json` metadata files; never your transcripts —
+  **unless** you pass `drop --with-transcript`, which also deletes the `.jsonl`, and even then
+  only when no *surviving* session still references it (so a copy in another account is never
+  orphaned). (The separate `regroup` command also writes the destination's Local Storage — see
+  **Regrouping**.)
 
 ## Running two accounts at once (instead of moving)
 
@@ -189,10 +197,8 @@ always the bare `Claude` dir and named tenants are always its `Claude-*` sibling
 `ALTPACA_CLAUDE_DIR` relocates the whole install (for tests or a non-standard location) but
 never promotes a sibling to be the default.
 
-> ⚠️ A **cross-tenant** `move`/`copy` relocates the session file but, by default, does **not**
-> carry sidebar group membership — that lives in each tenant's Local Storage. The session lands
-> ungrouped; altpaca warns you when this applies. Pass `--regroup` (or run `altpaca regroup`
-> afterward) to re-file membership by group **name** in the destination — see **Regrouping** below.
+> A **cross-tenant** `move`/`copy` relocates the session file *and* carries sidebar group
+> membership over — re-filed by group **name** in the destination (see **Regrouping** below).
 
 ## Groups
 
@@ -205,28 +211,32 @@ external deps). Each tenant has its own store, so altpaca reads groups **per ten
 - `--group NAME` selects a group in `list`/`move`/`copy`, case-insensitive.
 
 Moving a session **within a tenant** is keyed by session id, so its group membership is
-unaffected. Moving **across tenants** drops group membership by default (the assignment and
-group ids live in the source tenant's store) — use **Regrouping** to restore it. For the
-freshest read, quit the app first (recent group edits can sit in the leveldb write-ahead log
-until it flushes). "Projects" are just the session `cwd` — select with `--project`, no setup
-needed.
+unaffected. Moving **across tenants** would otherwise drop group membership (the assignment and
+group ids live in the source tenant's store), so altpaca re-files it automatically — see
+**Regrouping**. For the freshest read, quit the app first (recent group edits can sit in the
+leveldb write-ahead log until it flushes). "Projects" are just the session `cwd` — select with
+`--project`, no setup needed.
 
 ## Regrouping (carrying groups across tenants)
 
-A cross-tenant move only relocates the session file, so the session lands ungrouped in the
-destination. `regroup` puts it back in the right group — matched by group **name**:
+A cross-tenant move relocates only the session file, so on its own the session would land
+ungrouped in the destination. `regroup` puts it back in the right group — matched by group
+**name** — and it runs **automatically** as the tail of a cross-tenant `move`/`copy`. You can
+also run it standalone, e.g. to fix sessions moved earlier:
 
 ```bash
 altpaca regroup <src> <dst>            # dry-run: show what would be (re)grouped
 altpaca regroup <src> <dst> --apply    # write it (asks to confirm; backs up first)
-altpaca move <src> <dst> --all --regroup --apply   # move + regroup in one go
+altpaca move <src> <dst> --all --apply # move + auto-regroup
 ```
 
 How it recovers the grouping, even *after* a move: a move removes the session **file** from
 the source tenant but leaves its `customGroupAssignments` row intact, so altpaca reads each
 session's original group **name** from the source tenant's store, finds (or creates) the
 same-named group in the destination tenant, and assigns the session to it. Sessions already
-grouped in the destination are left alone unless you pass `--force`.
+grouped in the destination are left alone unless you pass `--force`. When regroup runs as part
+of a move it is *best-effort*: if it can't write (no destination group store, app reopened,
+unexpected schema), it warns and leaves the sessions ungrouped rather than failing the move.
 
 Unlike everything else altpaca does, `regroup` **writes** the destination's Local Storage. It
 does so by *appending* a single record to that store's leveldb write-ahead log (it never

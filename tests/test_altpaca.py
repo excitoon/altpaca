@@ -7,6 +7,7 @@ altpaca at it via ALTPACA_* env vars, so nothing touches a real install.
 import argparse
 import io
 import json
+import re
 import zipfile
 
 import pytest
@@ -146,6 +147,269 @@ def test_copy_keeps_source(env):
 def test_move_requires_selection(env):
     with pytest.raises(SystemExit):
         altpaca.main(["move", A[:8], B[:8]])  # no --all / selector
+
+
+# --------------------------------------------------------------------------- #
+# drop: delete sessions from an account. Metadata-only by default; --with-transcript
+# also removes the .jsonl, but never one a surviving session still references.
+# --------------------------------------------------------------------------- #
+def _transcript(env, cli):
+    return env.projects / "encoded" / f"{cli}.jsonl"
+
+
+def test_dry_run_drop_does_not_mutate(env, capsys):
+    altpaca.main(["drop", A[:8], "--all"])
+    out = capsys.readouterr().out
+    assert "DRY-RUN" in out and "DROP" in out
+    assert len(_src_files(env)) == 3  # nothing deleted
+
+
+def test_drop_requires_selection(env):
+    with pytest.raises(SystemExit):
+        altpaca.main(["drop", A[:8]])  # no --all / selector
+
+
+def test_apply_drop_removes_metadata_keeps_transcript(env):
+    cli = "c2222222-2222-2222-2222-222222222222"  # Beta
+    altpaca.main(["drop", A[:8], "--all", "--apply", "--yes"])
+    assert _src_files(env) == []  # all metadata removed
+    assert _transcript(env, cli).exists()  # transcript untouched by default
+    assert sorted(env.backups.glob("*.zip")), "a backup should have been written"
+
+
+def test_drop_selective_leaves_others(env):
+    altpaca.main(["drop", A[:8], "--project", "proj", "--apply", "--yes"])
+    assert len(_src_files(env)) == 2  # only the /proj session (Beta) removed
+
+
+def test_drop_then_restore_roundtrip(env):
+    altpaca.main(["drop", A[:8], "--all", "--apply", "--yes"])
+    assert _src_files(env) == []
+    backups = sorted(env.backups.glob("*.zip"))
+    altpaca.main(["restore", backups[-1].name, "--apply", "--yes"])
+    assert len(_src_files(env)) == 3  # every dropped session is back
+
+
+def test_drop_with_transcript_deletes_unreferenced(env):
+    cli = "c2222222-2222-2222-2222-222222222222"  # Beta, referenced only in A
+    assert _transcript(env, cli).exists()
+    altpaca.main(["drop", A[:8], "--title", "beta", "--with-transcript", "--apply", "--yes"])
+    assert not _transcript(env, cli).exists()  # its only session is gone -> deleted
+
+
+def test_drop_with_transcript_keeps_shared(env):
+    # copy Alpha to B first, so its transcript is referenced by two sessions
+    altpaca.main(["copy", A[:8], B[:8], "--title", "alpha", "--apply", "--yes"])
+    cli = "c1111111-1111-1111-1111-111111111111"
+    altpaca.main(["drop", A[:8], "--title", "alpha", "--with-transcript", "--apply", "--yes"])
+    assert _transcript(env, cli).exists()  # kept: B's copy still references it
+    assert len(_dst_files(env)) == 1  # the copy survives
+
+
+def test_drop_with_transcript_restore_roundtrip(env):
+    cli = "c2222222-2222-2222-2222-222222222222"
+    altpaca.main(["drop", A[:8], "--title", "beta", "--with-transcript", "--apply", "--yes"])
+    assert not _transcript(env, cli).exists() and len(_src_files(env)) == 2
+    backups = sorted(env.backups.glob("*.zip"))
+    altpaca.main(["restore", backups[-1].name, "--apply", "--yes"])
+    assert _transcript(env, cli).exists()  # transcript restored from backup
+    assert len(_src_files(env)) == 3
+
+
+def test_drop_shows_skipped_before_dying_when_plan_empties(env, monkeypatch, capsys):
+    # the only selected session is the currently-running one -> the plan empties.
+    # drop must print the skip reason (like move/copy) before erroring, not die mute.
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "c1111111-1111-1111-1111-111111111111")
+    with pytest.raises(SystemExit):
+        altpaca.main(["drop", A[:8], "--title", "alpha", "--apply", "--yes"])
+    out = capsys.readouterr().out
+    assert "DROP" in out and "currently running session" in out
+    assert len(_src_files(env)) == 3  # nothing deleted
+
+
+def test_drop_kept_count_dedupes_by_transcript(env, capsys):
+    # two A-account sessions sharing ONE transcript, kept alive by a copy in B:
+    # the "kept" line must count the file once, not once per dropped session.
+    shared_cli = "cshared0-0000-0000-0000-000000000000"
+    (env.projects / "encoded" / f"{shared_cli}.jsonl").write_text("{}\n")
+    for u in ("a1a1a1a1-0000-0000-0000-000000000000", "a2a2a2a2-0000-0000-0000-000000000000"):
+        (env.ccs / A / WA / f"local_{u}.json").write_text(
+            json.dumps(_meta(u, shared_cli, "/Users/x/shared", "S", False))
+        )
+    bu = "b9b9b9b9-0000-0000-0000-000000000000"  # surviving referrer in account B
+    (env.ccs / B / WB / f"local_{bu}.json").write_text(
+        json.dumps(_meta(bu, shared_cli, "/Users/x/shared", "S2", False))
+    )
+    altpaca.main(["drop", A[:8], "--project", "shared", "--with-transcript"])  # dry-run
+    out = capsys.readouterr().out
+    assert "1 transcript(s) kept" in out and "2 transcript(s) kept" not in out
+
+
+# --------------------------------------------------------------------------- #
+# accounts: the logged-in email is read from each tenant's claude.ai IndexedDB
+# (data.account = {uuid, email_address, full_name, ...}), framed as
+# 0x22 <len-byte> <utf-8 bytes>. We synthesize a minimal blob in that framing.
+# --------------------------------------------------------------------------- #
+def _idb_str(s):
+    b = s.encode("latin-1")  # V8 one-byte string: 0x22 + varint byte-length + Latin-1 bytes
+    return b'"' + altpaca._ldb_varint(len(b)) + b
+
+
+def _idb_str_2byte(s):
+    b = s.encode("utf-16-le")  # V8 two-byte string: 'c' + varint byte-length + UTF-16LE bytes
+    return b"c" + altpaca._ldb_varint(len(b)) + b
+
+
+def _write_idb_account(base, uuid, email, name):
+    rec = (
+        b"\xe5\x04datao"
+        + _idb_str("account")
+        + b"o"
+        + _idb_str("tagged_id")
+        + _idb_str("user_test")
+        + _idb_str("uuid")
+        + _idb_str(uuid)
+        + _idb_str("email_address")
+        + _idb_str(email)
+        + _idb_str("full_name")
+        + _idb_str(name)
+    )
+    d = base / "IndexedDB" / "https_claude.ai_0.indexeddb.blob" / "1" / "00"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "0001").write_bytes(rec)
+
+
+def test_accounts_parser_extracts_uuid_email_name():
+    blob = (
+        b"\xe5\x04datao"
+        + _idb_str("account")
+        + b"o"
+        + _idb_str("uuid")
+        + _idb_str(A)
+        + _idb_str("email_address")
+        + _idb_str("alice@example.com")
+        + _idb_str("full_name")
+        + _idb_str("Alice")
+    )
+    m = re.search(rb'"\x04uuid"\$([0-9a-fA-F-]{36})', blob)
+    assert m.group(1).decode() == A
+    assert altpaca._idb_string_after(blob, m.end(), "email_address") == "alice@example.com"
+    assert altpaca._idb_string_after(blob, m.end(), "full_name") == "Alice"
+
+
+def test_accounts_shows_logged_in_email(env, capsys):
+    _write_idb_account(env.base, A, "alice@example.com", "Alice")
+    altpaca.main(["accounts"])
+    out = capsys.readouterr().out
+    assert "email: alice@example.com  (Alice)" in out
+    # the account whose IndexedDB names it is marked precisely (not the activity guess)
+    a_line = next(line for line in out.splitlines() if line.startswith(A))
+    assert a_line.endswith("<- logged in")
+    assert "current login (guess)" not in out  # IndexedDB present -> precise marker, no guess
+    # account B has no IndexedDB record -> no email line, not marked logged in
+    assert not any(line.startswith(B) and "logged in" in line for line in out.splitlines())
+
+
+def test_accounts_without_idb_falls_back_to_guess(env, capsys):
+    altpaca.main(["accounts"])  # no IndexedDB written
+    out = capsys.readouterr().out
+    assert A in out and B in out
+    assert "email:" not in out
+    assert "current login (guess)" in out  # graceful fallback, no crash
+
+
+def test_idb_parser_handles_varint_length_over_127():
+    # a 200-byte one-byte string -> V8 frames its length as a 2-byte varint (0xc8 0x01).
+    # A single-byte length reader would truncate it.
+    long_name = "a" * 200
+    assert _idb_str(long_name)[1:3] == b"\xc8\x01"  # the boundary is genuinely exercised
+    blob = (
+        b"\xe5\x04datao"
+        + _idb_str("uuid")
+        + _idb_str(A)
+        + _idb_str("email_address")
+        + _idb_str("alice@example.com")
+        + _idb_str("full_name")
+        + _idb_str(long_name)
+    )
+    m = re.search(rb'"\x04uuid"\$([0-9a-fA-F-]{36})', blob)
+    assert altpaca._idb_string_after(blob, m.end(), "email_address") == "alice@example.com"
+    assert altpaca._idb_string_after(blob, m.end(), "full_name") == long_name  # full round-trip
+
+
+def test_idb_parser_decodes_two_byte_string_name():
+    # a non-ASCII (Cyrillic) name is stored by V8 as a TWO-byte string ('c' tag,
+    # UTF-16LE), NOT a one-byte string — the parser must decode it, not drop it.
+    name = "Владимир Чеботарёв"
+    blob = (
+        b"\xe5\x04datao"
+        + _idb_str("uuid")
+        + _idb_str(A)
+        + _idb_str("email_address")
+        + _idb_str("vova@example.com")
+        + _idb_str("full_name")
+        + _idb_str_2byte(name)
+    )
+    m = re.search(rb'"\x04uuid"\$([0-9a-fA-F-]{36})', blob)
+    assert altpaca._idb_string_after(blob, m.end(), "email_address") == "vova@example.com"
+    assert altpaca._idb_string_after(blob, m.end(), "full_name") == name
+
+
+def test_idb_scan_does_not_borrow_next_records_email(env):
+    # uuid A carries NO own email; a later record carries one. A must NOT inherit it.
+    other = "ffffffff-0000-0000-0000-000000000000"
+    blob = (
+        b"\xe5\x04datao"
+        + _idb_str("uuid")
+        + _idb_str(A)
+        + _idb_str("full_name")
+        + _idb_str("NoEmail")
+        + _idb_str("uuid")
+        + _idb_str(other)
+        + _idb_str("email_address")
+        + _idb_str("victim@other.com")
+    )
+    d = env.base / "IndexedDB" / "https_claude.ai_0.indexeddb.blob" / "1" / "00"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "0001").write_bytes(blob)
+    emails, _current = altpaca.account_identities()
+    assert A not in emails  # not poisoned with the next record's email
+    assert emails.get(other) == ("victim@other.com", None)
+
+
+def test_accounts_survives_corrupt_idb_blob(env, capsys):
+    # the uuid anchor + 'email_address' token are present but the value framing is a
+    # truncated/runaway varint — the parser must yield no email, never crash accounts.
+    d = env.base / "IndexedDB" / "https_claude.ai_0.indexeddb.blob" / "1" / "00"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "0001").write_bytes(b"\xe5\x04datao" + _idb_str("uuid") + _idb_str(A) + b'"\remail_address"\xff\xff\xff')
+    altpaca.main(["accounts"])  # must not raise
+    out = capsys.readouterr().out
+    assert A in out and "email:" not in out
+
+
+def test_accounts_email_unions_across_tenants(env):
+    # account uuid A lives in the default tenant (no IndexedDB email there) but a
+    # sibling tenant is signed into the SAME uuid -> its email fills in for A,
+    # while only the sibling is reported as actually signed in.
+    alt = env.base.parent / "Claude-excitoon"
+    (alt / "claude-code-sessions" / A / "wx00").mkdir(parents=True)
+    _write_idb_account(alt, A, "shared@acct.com", "Shared")
+    emails, current = altpaca.account_identities()
+    assert emails.get(A) == ("shared@acct.com", "Shared")
+    assert (str(alt), A) in current and (str(env.base), A) not in current
+
+
+def test_accounts_partial_readability_keeps_guess_for_unreadable_tenant(env, capsys):
+    # default tenant has no IndexedDB; a sibling does. The default tenant's accounts
+    # must still fall back to the activity guess, not be silently left unmarked.
+    alt = env.base.parent / "Claude-excitoon"
+    (alt / "claude-code-sessions" / B / "wx00").mkdir(parents=True)
+    _write_idb_account(alt, B, "ex@acct.com", "Ex")
+    altpaca.main(["accounts"])
+    out = capsys.readouterr().out
+    assert "current login (guess)" in out  # default tenant (unreadable) still guessed
+    assert "<- logged in" in out  # sibling tenant precisely marked
 
 
 def test_dump_writes_archive(env, tmp_path):
@@ -325,10 +589,11 @@ def test_tenant_qualified_ref_resolves(two_tenants):
 
 
 def test_cross_tenant_move_warns_about_groups(two_tenants, capsys):
+    # a cross-tenant move always auto-carries group membership
     altpaca.main(["move", f"excitoon/{A[:8]}", A[:8], "--all"])
     err = capsys.readouterr().err
-    assert "cross-tenant" in err and "GROUP membership will NOT carry" in err
-    assert "--regroup" in err  # the warning now points at the fix
+    assert "cross-tenant" in err
+    assert "carried over automatically" in err
 
 
 # --------------------------------------------------------------------------- #
@@ -559,16 +824,28 @@ def test_regroup_refuses_bad_schema_version(regroup_env):
         altpaca.main(["regroup", A[:8], f"excitoon/{B[:8]}", "--apply", "--yes"])
 
 
-def test_move_with_regroup_end_to_end(env, capsys):
-    """A fresh cross-tenant move --regroup files the moved sessions in one shot."""
+def test_move_auto_regroups_cross_tenant(env):
+    """A cross-tenant move files the moved sessions automatically (no flag needed)."""
     alt = env.base.parent / "Claude-excitoon"
     (alt / "claude-code-sessions" / B / WB).mkdir(parents=True)
     _build_ls(env.base, _src_store(), seq=100, log_number=3)
     _build_ls(alt, _dst_store(), seq=50, log_number=7)
     dst_ls = alt / "Local Storage" / "leveldb"
 
-    altpaca.main(["move", A[:8], f"excitoon/{B[:8]}", "--all", "--regroup", "--apply", "--yes", "--force"])
-    # the two grouped sessions are now filed in the destination store
+    altpaca.main(["move", A[:8], f"excitoon/{B[:8]}", "--all", "--apply", "--yes", "--force"])
     asg = _read_store(dst_ls)["customGroupAssignments"]
     assert "code:local_11111111-1111-1111-1111-111111111111" in asg
     assert "code:local_22222222-2222-2222-2222-222222222222" in asg
+
+
+def test_move_auto_regroup_best_effort_when_no_dst_store(env, capsys):
+    """If the destination has no group store, the move still succeeds and regroup just warns."""
+    alt = env.base.parent / "Claude-excitoon"
+    (alt / "claude-code-sessions" / B / WB).mkdir(parents=True)
+    _build_ls(env.base, _src_store(), seq=100, log_number=3)
+    # deliberately NO Local Storage for the excitoon tenant
+
+    altpaca.main(["move", A[:8], f"excitoon/{B[:8]}", "--all", "--apply", "--yes", "--force"])
+    moved = alt / "claude-code-sessions" / B / WB / "local_11111111-1111-1111-1111-111111111111.json"
+    assert moved.exists()  # the move itself completed
+    assert "group membership not carried" in capsys.readouterr().err  # best-effort warning, not a failure

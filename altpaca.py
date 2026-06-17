@@ -25,7 +25,8 @@
 #   addressed as "<suffix>/<uuid>" for named tenants and just "<uuid>" for the
 #   default one. Moving a session across tenants relocates the file but does NOT
 #   automatically carry group membership (that lives in per-tenant Local Storage).
-#   The `regroup` command (and `move/copy --regroup`) re-files membership by group
+#   The `regroup` command (run automatically as the tail of a cross-tenant
+#   move/copy, or standalone) re-files membership by group
 #   NAME: it recovers each session's source-tenant group name from the source's
 #   still-present dframe-store assignments and writes the matching assignment into
 #   the destination tenant's store, by *appending* one record to its leveldb
@@ -169,6 +170,95 @@ def _short_ref(ref: str) -> str:
         t, u = ref.split("/", 1)
         return f"{t}/{u[:8]}"
     return ref[:8]
+
+
+# --------------------------------------------------------------------------- #
+# account identity (READ-ONLY). The desktop app records the account currently
+# signed in for a tenant in its claude.ai IndexedDB, as a serialized object:
+#   data.account = {tagged_id, uuid, email_address, full_name, display_name}
+# Big values spill to external blob files under
+#   <tenant>/IndexedDB/https_claude.ai_*.indexeddb.blob/**.
+# That record's `uuid` IS the account's claude-code-sessions/<uuid> folder, so it
+# ties an account partition to the email signed into it. Strings are framed as
+#   0x22 <len-byte> <utf-8 bytes>. Best-effort and never written: any parse miss
+# just yields no email, and the listing falls back to the uuid alone.
+# --------------------------------------------------------------------------- #
+_IDB_MAX_BLOB = 64 * 1024 * 1024  # don't slurp giant attachment blobs hunting for a record
+
+
+def _idb_string_after(data: bytes, start: int, key: str, window: int = 4000):
+    """The V8-framed string value following the first `key` at/after `start`, or None.
+
+    V8 ValueSerializer frames a string as <tag><varint byte-length><bytes>, the tag
+    choosing the encoding: 0x22 (") one-byte/Latin-1, 'c' two-byte/UTF-16LE, 'S' UTF-8.
+    (`key` is itself a one-byte string, matched by its 0x22 + length prefix.)
+    """
+    kb = key.encode()
+    i = data.find(b'"' + bytes([len(kb)]) + kb, start)
+    if i < 0 or i - start > window:
+        return None
+    j = i + 2 + len(kb)  # past 0x22, the key-length byte, and the key itself
+    tag = data[j : j + 1]
+    try:
+        length, k = _uvarint(data, j + 1)  # value byte-length is a varint, not a single byte
+        raw = data[k : k + length]
+    except Exception:
+        return None
+    if tag == b'"':  # kOneByteString: Latin-1, one byte per char
+        return raw.decode("latin-1", "replace")
+    if tag == b"c":  # kTwoByteString: UTF-16LE (non-ASCII names land here)
+        return raw.decode("utf-16-le", "replace")
+    if tag == b"S":  # kUtf8String
+        return raw.decode("utf-8", "replace")
+    return None
+
+
+def _scan_idb_accounts(tenant: Tenant) -> dict:
+    """uuid -> (email, full_name) for any account login record in this tenant's
+    claude.ai IndexedDB. Returns {} when nothing is present or readable."""
+    out = {}
+    idb = tenant.base / "IndexedDB"
+    try:
+        blobs = list(idb.glob("https_claude.ai_*.indexeddb.blob/**/*"))
+    except Exception:
+        return out
+    for f in blobs:
+        try:
+            if not f.is_file() or f.stat().st_size > _IDB_MAX_BLOB:
+                continue
+            d = f.read_bytes()
+            if b"email_address" not in d:
+                continue
+            # Bound each account's email/name search to the bytes BEFORE the next uuid
+            # record, so one account never borrows the next record's email_address.
+            matches = list(re.finditer(rb'"\x04uuid"\$([0-9a-fA-F-]{36})', d))
+            for idx, m in enumerate(matches):
+                u = m.group(1).decode()
+                if u in out:
+                    continue
+                stop = matches[idx + 1].start() if idx + 1 < len(matches) else len(d)
+                seg = d[m.end() : stop]
+                email = _idb_string_after(seg, 0, "email_address")
+                if email:
+                    out[u] = (email, _idb_string_after(seg, 0, "full_name"))
+        except Exception:
+            continue  # best-effort: a malformed/foreign blob just yields no email, never a crash
+    return out
+
+
+def account_identities():
+    """(uuid -> (email, full_name), {(tenant_base, uuid)} signed-in per tenant).
+
+    Account uuids are global, so the union across every tenant's IndexedDB maps as
+    many account partitions to an email as the app has on disk; the second set
+    marks which account each tenant is *currently* signed into.
+    """
+    emails, current = {}, set()
+    for t in discover_tenants():
+        for u, ident in _scan_idb_accounts(t).items():
+            current.add((str(t.base), u))
+            emails.setdefault(u, ident)
+    return emails, current
 
 
 # --------------------------------------------------------------------------- #
@@ -990,6 +1080,8 @@ def cmd_accounts(args):
     sessions = discover()
     groups = by_account(sessions)
     cur = current_account(sessions)
+    emails, current_logins = account_identities()
+    login_tenants = {tb for tb, _ in current_logins}  # tenants whose IndexedDB named their login
     accts = all_account_objs()
     if not accts:
         print("no account partitions found.")
@@ -1004,9 +1096,16 @@ def cmd_accounts(args):
         arch = sum(1 for s in ss if s.archived)
         projs = len({s.cwd for s in ss})
         wss = workspaces_of(acc)
-        mark = "  <- current login (guess)" if (cur is not None and acc == cur) else ""
-        print(f"{acc.ref}")
-        print(f"  sessions={len(ss)}  archived={arch}  projects={projs}  workspaces={len(wss)}{mark}")
+        if str(acc.tenant.base) in login_tenants:  # this tenant's IndexedDB named its login
+            mark = "  <- logged in" if (str(acc.tenant.base), acc.uuid) in current_logins else ""
+        else:  # this tenant's IndexedDB was unreadable/absent — fall back to the activity guess
+            mark = "  <- current login (guess)" if (cur is not None and acc == cur) else ""
+        print(f"{acc.ref}{mark}")
+        ident = emails.get(acc.uuid)
+        if ident:
+            email, name = ident
+            print(f"  email: {email}" + (f"  ({name})" if name else ""))
+        print(f"  sessions={len(ss)}  archived={arch}  projects={projs}  workspaces={len(wss)}")
         newest = max(ss, key=lambda s: s.last_activity, default=None)
         if newest:
             print(f"  newest: {fmt_ts(newest.last_activity)}  {newest.title[:54]}")
@@ -1173,23 +1272,34 @@ def make_backup(originals: list, dests: list) -> Path:
     return archive
 
 
-def regroup(src_tenant, dst_tenant, candidates, *, apply, force, no_backup, yes, header=True):
+def regroup(src_tenant, dst_tenant, candidates, *, apply, force, no_backup, yes, header=True, best_effort=False):
     """Re-file `candidates` (sessions now in dst_tenant) into dst_tenant's groups
     by matching each session's source-tenant group NAME, writing the result by
     appending one record to the destination's Local Storage leveldb.
 
     Returns the number of sessions regrouped (0 on a dry-run). The Claude desktop
     app must be quit — it owns the destination's Local Storage.
+
+    `best_effort` (used when regroup runs automatically as the tail of a move): a
+    condition that would otherwise abort instead just warns and skips, so a failed
+    regroup never fails the move that already succeeded.
     """
+
+    def stop(msg):  # abort (strict) or warn-and-skip (best-effort)
+        if best_effort:
+            warn(f"group membership not carried — {msg} (run `altpaca regroup` later to fix)")
+            return 0
+        die(msg)
+
     if str(src_tenant.base) == str(dst_tenant.base):
-        die("regroup needs two different tenants (within-tenant moves keep grouping)")
+        return stop("regroup needs two different tenants (within-tenant moves keep grouping)")
     dst_ls = dst_tenant.local_storage
     if not dst_ls.exists():
-        die(f"destination tenant has no Local Storage at {dst_ls}")
+        return stop(f"destination tenant has no Local Storage at {dst_ls}")
 
     uuid2name = recover_source_group_names(src_tenant.local_storage)
     if not uuid2name:
-        die("no group assignments are recoverable from the source tenant's Local Storage")
+        return stop("no group assignments are recoverable from the source tenant's Local Storage")
 
     dst_merged, dst_max = _merge_ls(dst_ls)
     ver = next(
@@ -1197,13 +1307,13 @@ def regroup(src_tenant, dst_tenant, candidates, *, apply, force, no_backup, yes,
         None,
     )
     if ver is not None and ver != "1":
-        die(
+        return stop(
             f"destination Local Storage schema version is {ver!r}, expected '1' — refusing to write "
             "(the layout may have changed)"
         )
     dst_key, dst_store = _dframe_record(dst_merged)
     if dst_store is None or dst_key is None:
-        die("destination tenant has no group store yet — open the app once on that tenant first")
+        return stop("destination tenant has no group store yet — open the app once on that tenant first")
     st = _store_state(dst_store)
     assign = st.setdefault("customGroupAssignments", {})
     groups = st.setdefault("customGroups", [])
@@ -1243,6 +1353,8 @@ def regroup(src_tenant, dst_tenant, candidates, *, apply, force, no_backup, yes,
             print(f"  ... and {len(skipped) - 40} more")
 
     if not plan:
+        if best_effort:
+            return 0  # nothing recoverable to carry — not an error for an automatic pass
         die("nothing to regroup")
 
     if not apply:
@@ -1253,7 +1365,7 @@ def regroup(src_tenant, dst_tenant, candidates, *, apply, force, no_backup, yes,
         return 0
 
     if claude_running() and not force:
-        die(
+        return stop(
             "the Claude desktop app is running — quit it first (it owns this Local Storage and can "
             "clobber the write), then retry. use --force to override."
         )
@@ -1271,7 +1383,7 @@ def regroup(src_tenant, dst_tenant, candidates, *, apply, force, no_backup, yes,
     if active_log is None:
         logs = sorted(dst_ls.glob("*.log"))
         if not logs:
-            die("no .log file in the destination's Local Storage; cannot append a write")
+            return stop("no .log file in the destination's Local Storage; cannot append a write")
         active_log = max(logs, key=lambda p: p.name)
         warn(f"could not read MANIFEST; appending to highest-numbered log {active_log.name}")
     new_seq = max(dst_max, man_seq) + 1
@@ -1330,21 +1442,13 @@ def transfer(args, remove_source: bool):
         die("source and destination are the same account")
 
     cross_tenant = str(src.tenant.base) != str(dst.tenant.base)
-    regrouping = cross_tenant and getattr(args, "regroup", False)
+    regrouping = cross_tenant
     if cross_tenant:
         tlabel = f"{src.tenant.name or 'default'} -> {dst.tenant.name or 'default'}"
-        if regrouping:
-            warn(
-                f"cross-tenant {verb} ({tlabel}): after the {verb}, group membership will be re-filed "
-                f"by group NAME in the destination's Local Storage (--regroup)."
-            )
-        else:
-            warn(
-                f"cross-tenant {verb} ({tlabel}): session files move, but sidebar GROUP membership will "
-                "NOT carry — groups live in each tenant's own Local Storage. Pass --regroup to re-file it "
-                "by group name (or run `altpaca regroup <src> <dst>` afterward); otherwise sessions land "
-                "ungrouped."
-            )
+        warn(
+            f"cross-tenant {verb} ({tlabel}): sidebar group membership will be carried over "
+            "automatically — re-filed by group NAME in the destination's Local Storage."
+        )
 
     sessions = discover()
     src_ss = [s for s in sessions if s.account_ref == src.ref]
@@ -1411,7 +1515,7 @@ def transfer(args, remove_source: bool):
     if not args.apply:
         if regrouping:
             print(
-                f"(--regroup) would then re-file up to {len(plan)} moved session(s) "
+                f"then auto-regroup: would re-file up to {len(plan)} moved session(s) "
                 f"by group name in {dst.tenant.name or 'default'}."
             )
         print(f"\nDRY-RUN — nothing changed. Re-run with --apply to {verb}. (add --yes to skip the prompt)")
@@ -1460,6 +1564,7 @@ def transfer(args, remove_source: bool):
             no_backup=args.no_backup,
             yes=True,  # the move itself was already confirmed above
             header=True,
+            best_effort=True,  # never let a regroup hiccup fail a completed move
         )
 
 
@@ -1469,6 +1574,111 @@ def cmd_move(args):
 
 def cmd_copy(args):
     transfer(args, remove_source=False)
+
+
+def cmd_drop(args):
+    """Delete selected sessions from an account.
+
+    Removes each session's local_*.json metadata file, so it disappears from the
+    app's history list. Transcripts are account-agnostic and may be shared, so they
+    are left in place by default (matching move/copy, which never touch them); pass
+    --with-transcript to also delete a transcript — but only when no *surviving*
+    session still references it, so a copy in another account is never orphaned.
+    Dry-run by default; backs up before deleting (undo with `restore`).
+    """
+    acc = resolve_account(args.account)
+    sessions = discover()
+    acc_ss = [s for s in sessions if s.account_ref == acc.ref]
+
+    if has_positive_selector(args):
+        chosen = select(acc_ss, args)
+    elif args.all:
+        chosen = select(acc_ss, args)  # still honors --skip-archived
+    else:
+        die("refusing to act without a selection — pass --all or a selector (--session/--project/--title)")
+
+    if not chosen:
+        die("no matching sessions in that account")
+
+    env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    plan, skipped = [], []
+    for s in chosen:
+        if env_sid and (s.cli_id == env_sid or s.uuid == env_sid):
+            skipped.append((s, "currently running session"))
+            continue
+        plan.append(s)
+
+    # transcript deletion (opt-in): only drop a .jsonl when nothing that survives
+    # this run still points at it — a copy in another account shares the same
+    # transcript and deleting it would orphan that session.
+    transcripts, kept_shared = [], set()
+    if args.with_transcript:
+        drop_paths = {s.path for s in plan}
+        surviving = {s.cli_id for s in sessions if s.cli_id and s.path not in drop_paths}
+        seen_t = set()
+        for s in plan:
+            tpath = s.transcript()
+            if not tpath:
+                continue
+            if s.cli_id in surviving:
+                kept_shared.add(tpath)  # distinct files, so the "kept" count below is by file
+            elif tpath not in seen_t:
+                seen_t.add(tpath)
+                transcripts.append(tpath)
+
+    print(f"DROP  {acc.short}")
+    print(f"{len(plan)} session(s) to delete:")
+    print_session_rows(plan)
+    if args.with_transcript:
+        print(f"\n  + {len(transcripts)} transcript file(s) will also be deleted")
+        if kept_shared:
+            print(f"  ! {len(kept_shared)} transcript(s) kept — still referenced by a surviving session")
+    if skipped:
+        print(f"\nskipping {len(skipped)}:")
+        for s, why in skipped:
+            print(f"  {s.uuid[:8]}  {why}  ({s.title[:40]})")
+
+    if not plan:
+        die("nothing to do")
+
+    if not args.apply:
+        print("\nDRY-RUN — nothing changed. Re-run with --apply to delete. (add --yes to skip the prompt)")
+        return
+
+    if claude_running() and not args.force:
+        die(
+            "the Claude desktop app is running — quit it first (it can overwrite changes on exit), "
+            "then retry. use --force to override."
+        )
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            die("refusing to apply without confirmation; pass --yes")
+        extra = f" + {len(transcripts)} transcript(s)" if transcripts else ""
+        if input(f"\nProceed to DELETE {len(plan)} session(s){extra}? [y/N] ").strip().lower() not in ("y", "yes"):
+            die("aborted")
+
+    backup_dir = None
+    if not args.no_backup:
+        backup_dir = make_backup([s.path for s in plan] + transcripts, [])
+        print(f"backup: {backup_dir}")
+
+    done = 0
+    for s in plan:
+        if s.path.exists():
+            s.path.unlink()
+        done += 1
+    for tp in transcripts:
+        try:
+            Path(tp).unlink()
+        except FileNotFoundError:
+            pass
+
+    tnote = f" and {len(transcripts)} transcript(s)" if transcripts else ""
+    print(f"\ndeleted {done} session(s){tnote} from {acc.short}.")
+    print("restart the Claude desktop app to see them gone.")
+    if backup_dir:
+        print(f"undo with:  altpaca restore {backup_dir.name}")
 
 
 def cmd_restore(args):
@@ -1586,7 +1796,7 @@ def build_parser():
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("accounts", help="list account partitions and their session counts")
+    sp = sub.add_parser("accounts", help="list account partitions, their signed-in email, and session counts")
     sp.set_defaults(func=cmd_accounts)
 
     sp = sub.add_parser("list", help="list sessions (all accounts if none given)")
@@ -1616,13 +1826,21 @@ def build_parser():
         sp.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
         sp.add_argument("--no-backup", action="store_true", help="do not back up before mutating")
         sp.add_argument("--force", action="store_true", help="proceed despite warnings")
-        sp.add_argument(
-            "--regroup",
-            action="store_true",
-            help="on a cross-tenant move/copy, also re-file sidebar group membership by group name "
-            "in the destination (writes its Local Storage; see the `regroup` command)",
-        )
         sp.set_defaults(func=cmd_move if remove else cmd_copy)
+
+    sp = sub.add_parser("drop", help="delete sessions from an account (removes them from the app)")
+    sp.add_argument("account", help="account ref '<uuid>' or '<tenant>/<uuid>' (prefix ok)")
+    add_selectors(sp)
+    sp.add_argument(
+        "--with-transcript",
+        action="store_true",
+        help="also delete the .jsonl transcript (kept if a surviving session still references it)",
+    )
+    sp.add_argument("--apply", action="store_true", help="actually delete (default: dry-run)")
+    sp.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    sp.add_argument("--no-backup", action="store_true", help="do not back up before deleting")
+    sp.add_argument("--force", action="store_true", help="proceed despite warnings")
+    sp.set_defaults(func=cmd_drop)
 
     sp = sub.add_parser(
         "regroup",
