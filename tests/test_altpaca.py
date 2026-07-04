@@ -260,7 +260,7 @@ def _idb_str_2byte(s):
     return b"c" + altpaca._ldb_varint(len(b)) + b
 
 
-def _write_idb_account(base, uuid, email, name):
+def _write_idb_account(base, uuid, email, name, name_frame=_idb_str):
     rec = (
         b"\xe5\x04datao"
         + _idb_str("account")
@@ -272,11 +272,15 @@ def _write_idb_account(base, uuid, email, name):
         + _idb_str("email_address")
         + _idb_str(email)
         + _idb_str("full_name")
-        + _idb_str(name)
+        + name_frame(name)  # one-byte by default; pass _idb_str_2byte for non-ASCII
     )
     d = base / "IndexedDB" / "https_claude.ai_0.indexeddb.blob" / "1" / "00"
     d.mkdir(parents=True, exist_ok=True)
     (d / "0001").write_bytes(rec)
+
+
+def _write_idb_account_2byte(base, uuid, email, name):
+    _write_idb_account(base, uuid, email, name, name_frame=_idb_str_2byte)
 
 
 def test_accounts_parser_extracts_uuid_email_name():
@@ -410,6 +414,84 @@ def test_accounts_partial_readability_keeps_guess_for_unreadable_tenant(env, cap
     out = capsys.readouterr().out
     assert "current login (guess)" in out  # default tenant (unreadable) still guessed
     assert "<- logged in" in out  # sibling tenant precisely marked
+
+
+# --------------------------------------------------------------------------- #
+# --json: the read commands emit a machine-readable structure instead of text.
+# --------------------------------------------------------------------------- #
+def test_accounts_json_structure(env, capsys):
+    _write_idb_account(env.base, A, "alice@example.com", "Alice")
+    altpaca.main(["accounts", "--json"])
+    data = json.loads(capsys.readouterr().out)  # pure JSON, no human text mixed in
+    assert {t["name"] for t in data["tenants"]} == {""}
+    accts = {a["uuid"]: a for a in data["accounts"]}
+    assert accts[A]["email"] == "alice@example.com" and accts[A]["name"] == "Alice"
+    assert accts[A]["logged_in"] is True and accts[A]["sessions"] == 3
+    assert accts[A]["archived"] == 1  # Gamma
+    assert accts[A]["newest"]["title"] in {"Alpha", "Beta beta", "Gamma"}  # populated when sessions exist
+    assert accts[B]["email"] is None and accts[B]["logged_in"] is False
+    assert accts[B]["newest"] is None  # no sessions -> null, not omitted
+
+
+def test_list_json_structure(env, capsys):
+    altpaca.main(["list", A[:8], "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert len(data["accounts"]) == 1
+    acc = data["accounts"][0]
+    assert acc["ref"] == A
+    assert {s["title"] for s in acc["sessions"]} == {"Alpha", "Beta beta", "Gamma"}
+    s0 = acc["sessions"][0]
+    assert {"uuid", "cli_id", "cwd", "title", "archived", "created", "last_activity", "group", "has_transcript"} <= set(
+        s0
+    )
+    assert all(s["has_transcript"] for s in acc["sessions"])  # fixtures have transcripts
+    assert any(s["archived"] for s in acc["sessions"])  # Gamma archived
+
+
+def test_list_json_respects_selectors(env, capsys):
+    altpaca.main(["list", A[:8], "--project", "proj", "--json"])
+    data = json.loads(capsys.readouterr().out)
+    titles = [s["title"] for s in data["accounts"][0]["sessions"]]
+    assert titles == ["Beta beta"]  # only the /proj session
+
+
+def test_list_json_all_accounts(env, capsys):
+    altpaca.main(["list", "--json"])  # no account -> every account (list's primary mode)
+    data = json.loads(capsys.readouterr().out)
+    byref = {a["ref"]: a for a in data["accounts"]}
+    assert set(byref) == {A, B}
+    assert byref[B]["sessions"] == []  # empty destination account still emitted, not dropped
+    assert {s["title"] for s in byref[A]["sessions"]} == {"Alpha", "Beta beta", "Gamma"}
+
+
+def test_groups_json_structure(env, monkeypatch, capsys):
+    _fake_native(monkeypatch)  # Alpha in "Work"; groups Work, Home
+    altpaca.main(["groups", "--json"])
+    data = json.loads(capsys.readouterr().out)
+    t0 = data["tenants"][0]
+    gmap = {g["name"]: g for g in t0["groups"]}
+    assert {"Work", "Home"} <= set(gmap)
+    assert [s["title"] for s in gmap["Work"]["sessions"]] == ["Alpha"]
+    assert gmap["Work"]["sessions"][0]["group"] == "Work"
+    assert gmap["Home"]["sessions"] == []
+    assert {s["title"] for s in t0["ungrouped"]} == {"Beta beta", "Gamma"}
+
+
+def test_doctor_json_structure(env, capsys):
+    altpaca.main(["doctor", "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert data["base_exists"] is True and data["claude_running"] is False
+    assert data["env_session_id"] is None
+    assert {a["ref"] for a in data["accounts"]} == {A, B}
+
+
+def test_json_preserves_non_ascii(env, capsys):
+    # a two-byte (Cyrillic) name must survive JSON as real UTF-8, not \uXXXX-mangled
+    _write_idb_account_2byte(env.base, A, "vova@example.com", "Влади́мир")
+    altpaca.main(["accounts", "--json"])
+    raw = capsys.readouterr().out
+    assert "Влади́мир" in raw  # ensure_ascii=False keeps it human-readable
+    assert json.loads(raw)["accounts"][0]["name"] == "Влади́мир"
 
 
 def test_dump_writes_archive(env, tmp_path):

@@ -1075,40 +1075,92 @@ def print_session_rows(sessions: list, uuid2group: dict = None):
 
 # --------------------------------------------------------------------------- #
 # commands
+#
+# The read commands (accounts/list/groups/doctor) each build a plain data
+# structure once and render EITHER JSON (--json) or the human text from it, so
+# the two views can never drift.
 # --------------------------------------------------------------------------- #
+def emit_json(obj):
+    """Print a JSON document — the --json rendering for the read commands."""
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def _session_dict(s: Session, group=None) -> dict:
+    """A session as JSON-serializable fields (timestamps are epoch-ms ints)."""
+    return {
+        "uuid": s.uuid,
+        "session_id": s.session_id,
+        "cli_id": s.cli_id,
+        "account": s.account_ref,
+        "tenant": s.tenant_name,
+        "workspace": s.workspace,
+        "cwd": s.cwd,
+        "title": s.title,
+        "archived": s.archived,
+        "created": s.created,
+        "last_activity": s.last_activity,
+        "group": group,
+        "has_transcript": s.transcript() is not None,
+    }
+
+
 def cmd_accounts(args):
     sessions = discover()
     groups = by_account(sessions)
     cur = current_account(sessions)
     emails, current_logins = account_identities()
     login_tenants = {tb for tb, _ in current_logins}  # tenants whose IndexedDB named their login
+    tenants = discover_tenants()
     accts = all_account_objs()
+
+    rows = []
+    for acc in accts:
+        ss = groups.get(acc.ref, [])
+        if str(acc.tenant.base) in login_tenants:  # this tenant's IndexedDB named its login
+            logged_in = (str(acc.tenant.base), acc.uuid) in current_logins
+            guess = False
+        else:  # this tenant's IndexedDB was unreadable/absent — fall back to the activity guess
+            logged_in = False
+            guess = cur is not None and acc == cur
+        ident = emails.get(acc.uuid)
+        newest = max(ss, key=lambda s: s.last_activity, default=None)
+        rows.append(
+            {
+                "ref": acc.ref,
+                "tenant": acc.tenant.name,
+                "uuid": acc.uuid,
+                "email": ident[0] if ident else None,
+                "name": ident[1] if ident else None,
+                "logged_in": logged_in,
+                "current_login_guess": guess,
+                "sessions": len(ss),
+                "archived": sum(1 for s in ss if s.archived),
+                "projects": len({s.cwd for s in ss}),
+                "workspaces": len(workspaces_of(acc)),
+                "newest": {"last_activity": newest.last_activity, "title": newest.title} if newest else None,
+            }
+        )
+
+    if getattr(args, "json", False):
+        emit_json({"tenants": [{"name": t.name, "base": str(t.base)} for t in tenants], "accounts": rows})
+        return
+
     if not accts:
         print("no account partitions found.")
         return
-    tenants = discover_tenants()
     print(f"Claude session partitions across {len(tenants)} tenant(s):")
     for t in tenants:
         print(f"  {t.name or '(default)':12}  {t.base}")
     print()
-    for acc in accts:
-        ss = groups.get(acc.ref, [])
-        arch = sum(1 for s in ss if s.archived)
-        projs = len({s.cwd for s in ss})
-        wss = workspaces_of(acc)
-        if str(acc.tenant.base) in login_tenants:  # this tenant's IndexedDB named its login
-            mark = "  <- logged in" if (str(acc.tenant.base), acc.uuid) in current_logins else ""
-        else:  # this tenant's IndexedDB was unreadable/absent — fall back to the activity guess
-            mark = "  <- current login (guess)" if (cur is not None and acc == cur) else ""
-        print(f"{acc.ref}{mark}")
-        ident = emails.get(acc.uuid)
-        if ident:
-            email, name = ident
-            print(f"  email: {email}" + (f"  ({name})" if name else ""))
-        print(f"  sessions={len(ss)}  archived={arch}  projects={projs}  workspaces={len(wss)}")
-        newest = max(ss, key=lambda s: s.last_activity, default=None)
-        if newest:
-            print(f"  newest: {fmt_ts(newest.last_activity)}  {newest.title[:54]}")
+    for a in rows:
+        mark = "  <- logged in" if a["logged_in"] else "  <- current login (guess)" if a["current_login_guess"] else ""
+        print(f"{a['ref']}{mark}")
+        if a["email"]:
+            print(f"  email: {a['email']}" + (f"  ({a['name']})" if a["name"] else ""))
+        se, ar, pr, ws = a["sessions"], a["archived"], a["projects"], a["workspaces"]
+        print(f"  sessions={se}  archived={ar}  projects={pr}  workspaces={ws}")
+        if a["newest"]:
+            print(f"  newest: {fmt_ts(a['newest']['last_activity'])}  {a['newest']['title'][:54]}")
         print()
     print("Pick source/destination by the account ref ('<uuid>', or '<tenant>/<uuid>'; prefixes ok):")
     print("  altpaca list <account>")
@@ -1118,16 +1170,40 @@ def cmd_accounts(args):
 def cmd_list(args):
     sessions = discover()
     accounts = [resolve_account(args.account)] if args.account else all_account_objs()
+
+    blocks = []  # (account, selected sessions, uuid->group map)
+    for acc in accounts:
+        ss = [s for s in sessions if s.account_ref == acc.ref]
+        if has_positive_selector(args) or args.skip_archived:
+            ss = select(ss, args)
+        uuid2group, _names = native_groups(acc.tenant)
+        blocks.append((acc, ss, uuid2group))
+
+    if getattr(args, "json", False):
+        emit_json(
+            {
+                "accounts": [
+                    {
+                        "ref": acc.ref,
+                        "tenant": acc.tenant.name,
+                        "uuid": acc.uuid,
+                        "sessions": [
+                            _session_dict(s, uuid2group.get(s.uuid))
+                            for s in sorted(ss, key=lambda x: x.last_activity, reverse=True)
+                        ],
+                    }
+                    for acc, ss, uuid2group in blocks
+                ]
+            }
+        )
+        return
+
     if not accounts:
         print("no accounts found.")
         return
     cur = current_account(sessions)
     total = 0
-    for i, acc in enumerate(accounts):
-        ss = [s for s in sessions if s.account_ref == acc.ref]
-        if has_positive_selector(args) or args.skip_archived:
-            ss = select(ss, args)
-        uuid2group, _names = native_groups(acc.tenant)
+    for i, (acc, ss, uuid2group) in enumerate(blocks):
         show_group = bool(uuid2group)
         mark = "  <- current login (guess)" if (not args.account and acc == cur) else ""
         if i:
@@ -1730,8 +1806,27 @@ def cmd_restore(args):
 
 
 def cmd_doctor(args):
-    print(f"base dir         : {base_dir()}  ({'ok' if base_dir().exists() else 'MISSING'})")
     tenants = discover_tenants()
+    accts = all_account_objs()
+    if getattr(args, "json", False):
+        emit_json(
+            {
+                "base_dir": str(base_dir()),
+                "base_exists": base_dir().exists(),
+                "tenants": [
+                    {"name": t.name, "base": str(t.base), "sessions_root_exists": t.sessions_root.exists()}
+                    for t in tenants
+                ],
+                "projects_dir": str(projects_dir()),
+                "projects_dir_exists": projects_dir().exists(),
+                "backup_root": str(backup_root()),
+                "claude_running": claude_running(),
+                "env_session_id": os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
+                "accounts": [{"ref": a.ref, "workspaces": len(workspaces_of(a))} for a in accts],
+            }
+        )
+        return
+    print(f"base dir         : {base_dir()}  ({'ok' if base_dir().exists() else 'MISSING'})")
     print(f"tenants          : {len(tenants)}")
     for t in tenants:
         sr = t.sessions_root
@@ -1741,7 +1836,6 @@ def cmd_doctor(args):
     print(f"backup root      : {backup_root()}")
     print(f"Claude running   : {'yes (quit before moving)' if claude_running() else 'no'}")
     print(f"env session id   : {os.environ.get('CLAUDE_CODE_SESSION_ID', '(unset)')}")
-    accts = all_account_objs()
     print(f"accounts         : {len(accts)}")
     for a in accts:
         print(f"  {a.ref}  workspaces={len(workspaces_of(a))}")
@@ -1749,28 +1843,56 @@ def cmd_doctor(args):
 
 def cmd_groups(args):
     sessions = discover()
-    any_groups = False
+    blocks = []  # (tenant, group names, name->members, ungrouped)
     for t in discover_tenants():
         uuid2group, names = native_groups(t)
         if not names:
             continue
-        if any_groups:
-            print()
-        any_groups = True
-        if t.name:  # header only for named tenants; default stays bare
-            print(f"=== tenant {t.name} ===")
         index = {s.uuid: s for s in sessions if str((s.tenant or default_tenant()).base) == str(t.base)}
         members = {n: [] for n in names}
         for uuid, gname in uuid2group.items():
             if uuid in index:
                 members.setdefault(gname, []).append(index[uuid])
+        ungrouped = [s for s in index.values() if s.uuid not in uuid2group]
+        blocks.append((t, names, members, ungrouped))
+
+    def _by_recent(ss):
+        return sorted(ss, key=lambda x: x.last_activity, reverse=True)
+
+    if getattr(args, "json", False):
+        emit_json(
+            {
+                "tenants": [
+                    {
+                        "tenant": t.name,
+                        "groups": [
+                            {
+                                "name": name,
+                                "sessions": [_session_dict(s, name) for s in _by_recent(members.get(name, []))],
+                            }
+                            for name in names
+                        ],
+                        "ungrouped": [_session_dict(s) for s in _by_recent(ungrouped)],
+                    }
+                    for t, names, members, ungrouped in blocks
+                ]
+            }
+        )
+        return
+
+    any_groups = False
+    for t, names, members, ungrouped in blocks:
+        if any_groups:
+            print()
+        any_groups = True
+        if t.name:  # header only for named tenants; default stays bare
+            print(f"=== tenant {t.name} ===")
         for name in names:
             present = members.get(name, [])
             print(f"{name}  ({len(present)} session(s) present)")
-            for s in sorted(present, key=lambda x: x.last_activity, reverse=True):
+            for s in _by_recent(present):
                 base = os.path.basename(s.cwd.rstrip("/")) or s.cwd or "?"
                 print(f"  {s.uuid[:8]}  {base[:18]:18}  {s.title[:50]}")
-        ungrouped = [s for s in index.values() if s.uuid not in uuid2group]
         if ungrouped:
             print(f"\nUngrouped: {len(ungrouped)} session(s) present")
     if not any_groups:
@@ -1780,6 +1902,10 @@ def cmd_groups(args):
 # --------------------------------------------------------------------------- #
 # cli
 # --------------------------------------------------------------------------- #
+def add_json(sp):
+    sp.add_argument("--json", action="store_true", help="emit machine-readable JSON instead of the text output")
+
+
 def add_selectors(sp):
     sp.add_argument("--all", action="store_true", help="select every session in the source account")
     sp.add_argument("--session", nargs="+", metavar="ID", help="select by session/cli uuid (prefix ok)")
@@ -1797,11 +1923,13 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("accounts", help="list account partitions, their signed-in email, and session counts")
+    add_json(sp)
     sp.set_defaults(func=cmd_accounts)
 
     sp = sub.add_parser("list", help="list sessions (all accounts if none given)")
     sp.add_argument("account", nargs="?", help="account ref '<uuid>' or '<tenant>/<uuid>' (prefix ok; omit for all)")
     add_selectors(sp)
+    add_json(sp)
     sp.set_defaults(func=cmd_list)
 
     sp = sub.add_parser("dump", help="archive a whole account's sessions into one .zip (metadata + transcripts)")
@@ -1811,6 +1939,7 @@ def build_parser():
     sp.set_defaults(func=cmd_dump)
 
     sp = sub.add_parser("groups", help="list the app's custom groups and their members (read-only)")
+    add_json(sp)
     sp.set_defaults(func=cmd_groups)
 
     for name, helptext, remove in (
@@ -1866,6 +1995,7 @@ def build_parser():
     sp.set_defaults(func=cmd_restore)
 
     sp = sub.add_parser("doctor", help="show detected paths and environment")
+    add_json(sp)
     sp.set_defaults(func=cmd_doctor)
 
     return p

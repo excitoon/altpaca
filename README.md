@@ -55,6 +55,10 @@ altpaca accounts
 # list sessions in an account (uuid prefix is fine)
 altpaca list aaaaaaaa
 
+# any read command (accounts/list/groups/doctor) can emit JSON for scripting
+altpaca accounts --json
+altpaca list aaaaaaaa --json | jq -r '.accounts[].sessions[].title'
+
 # move them — DRY RUN by default, nothing changes until --apply
 altpaca move aaaaaaaa bbbbbbbb --all
 altpaca move aaaaaaaa bbbbbbbb --all --apply        # do it (asks to confirm)
