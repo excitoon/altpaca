@@ -66,7 +66,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     monkeypatch.setattr(altpaca, "_NATIVE_CACHE", {}, raising=False)
     # stay hermetic: don't let a real running Claude.app trip the apply-guard
-    monkeypatch.setattr(altpaca, "claude_running", lambda: False)
+    # (accept the optional tenant arg the scoped guard now passes)
+    monkeypatch.setattr(altpaca, "claude_running", lambda *a, **k: False)
     return argparse.Namespace(base=base, ccs=ccs, projects=projects, backups=backups)
 
 
@@ -483,6 +484,298 @@ def test_doctor_json_structure(env, capsys):
     assert data["base_exists"] is True and data["claude_running"] is False
     assert data["env_session_id"] is None
     assert {a["ref"] for a in data["accounts"]} == {A, B}
+
+
+def test_running_desktops_parses_only_the_executable(monkeypatch):
+    """_running_claude_desktops matches argv[0] (not any arg that mentions the app
+    path), reads --user-data-dir even past later flags / spaces, treats a flagless
+    desktop as the default tenant, and decodes ps output leniently (never fails open
+    on a stray non-UTF-8 byte in some unrelated process)."""
+    AS = "/tmp/AS"
+    stdout = "\n".join(
+        [
+            f"/Applications/Claude.app/Contents/MacOS/Claude --user-data-dir={AS}/Claude-excitoon",
+            "/Applications/Claude.app/Contents/MacOS/Claude",  # default tenant: no flag
+            # lowercase CLI + helper: argv[0] doesn't end in ".../MacOS/Claude" → ignored
+            f"{AS}/Claude-x/claude-code/2/claude.app/Contents/MacOS/claude --output-format stream-json",
+            "/Applications/Claude.app/Contents/Helpers/disclaimer /x/claude --model opus",
+            # benign process whose ARGUMENT merely contains the marker string → ignored
+            "grep -r Claude.app/Contents/MacOS/Claude /Users/x/life",
+            # a replaced byte (what errors='replace' yields) in an unrelated command
+            "/usr/bin/weird �� job",
+            # flags after --user-data-dir, and a space inside the path
+            f"/Applications/Claude.app/Contents/MacOS/Claude --user-data-dir={AS}/App Support/Claude-foo --enable-logging",
+        ]
+    )
+    captured = {}
+
+    def fake_run(argv, **kw):
+        captured.update(kw)
+        return argparse.Namespace(stdout=stdout, returncode=0)
+
+    monkeypatch.setattr(altpaca.subprocess, "run", fake_run)
+    dirs = [str(d) for d in altpaca._running_claude_desktops()]
+    assert dirs == [
+        f"{AS}/Claude-excitoon",
+        str(altpaca.DEFAULT_BASE),
+        f"{AS}/App Support/Claude-foo",
+    ]
+    # ps -A dumps every process's argv; a stray byte must be decoded, not raised
+    assert captured.get("errors") == "replace" and captured.get("text") is True
+
+
+def test_running_guard_ignores_unrelated_and_scopes(monkeypatch):
+    """A process that merely mentions the app path never blocks; the guard fires
+    only for the tenant whose desktop app is actually running."""
+    AS = "/tmp/AS2"
+    monkeypatch.setattr(
+        altpaca.subprocess,
+        "run",
+        lambda argv, **kw: argparse.Namespace(
+            stdout="grep -r Claude.app/Contents/MacOS/Claude /Users/x/life\n", returncode=0
+        ),
+    )
+    assert altpaca._running_claude_desktops() == []
+    assert altpaca.claude_running(altpaca.default_tenant()) is False
+    assert altpaca.claude_running() is False
+
+    monkeypatch.setattr(
+        altpaca.subprocess,
+        "run",
+        lambda argv, **kw: argparse.Namespace(
+            stdout=f"/Applications/Claude.app/Contents/MacOS/Claude --user-data-dir={AS}/Claude-excitoon\n",
+            returncode=0,
+        ),
+    )
+    excitoon = altpaca.Tenant("excitoon", f"{AS}/Claude-excitoon")
+    other = altpaca.Tenant("mikhail", f"{AS}/Claude-mikhail")
+    assert altpaca.claude_running(excitoon) is True  # its app is up → blocks
+    assert altpaca.claude_running(other) is False  # unrelated tenant → clear
+    assert altpaca.claude_running([other, excitoon]) is True  # any match blocks
+    assert altpaca.claude_running([]) is False  # empty watch list never blocks
+
+
+def test_count_transcript_tokens_dedup_and_iterations(tmp_path):
+    """input+output are summed per DISTINCT assistant message (duplicate copies
+    counted once), take max(top-level, sum(iterations)), and skip synthetic /
+    non-assistant / malformed lines."""
+    lines = [
+        # message with iterations (top-level zeroed), persisted 3× with same id → once
+        {"type": "assistant", "message": {"id": "msg_X", "model": "claude-opus-4-8", "usage": {
+            "input_tokens": 0, "output_tokens": 0,
+            "iterations": [{"input_tokens": 2, "output_tokens": 1000}, {"input_tokens": 0, "output_tokens": 500}]}}},
+        {"type": "assistant", "message": {"id": "msg_X", "model": "claude-opus-4-8", "usage": {
+            "input_tokens": 0, "output_tokens": 0,
+            "iterations": [{"input_tokens": 2, "output_tokens": 1000}, {"input_tokens": 0, "output_tokens": 500}]}}},
+        {"type": "assistant", "message": {"id": "msg_X", "model": "claude-opus-4-8", "usage": {
+            "input_tokens": 0, "output_tokens": 0,
+            "iterations": [{"input_tokens": 2, "output_tokens": 1000}, {"input_tokens": 0, "output_tokens": 500}]}}},
+        # plain message, no iterations → top-level values
+        {"type": "assistant", "message": {"id": "msg_Y", "model": "claude-opus-4-8", "usage": {
+            "input_tokens": 10, "output_tokens": 20}}},
+        # synthetic → excluded
+        {"type": "assistant", "message": {"id": "msg_S", "model": "<synthetic>", "usage": {"output_tokens": 999}}},
+        # non-assistant line that still carries "usage" → skipped by the type guard
+        {"type": "user", "message": {"usage": {"output_tokens": 777}}},
+    ]
+    p = tmp_path / "t.jsonl"
+    p.write_text("\n".join(json.dumps(x) for x in lines) + "\nnot valid json\n")
+    inp, out = altpaca._count_transcript_tokens(p)
+    assert (inp, out) == (2 + 10, 1500 + 20)  # X counted once (max iter-sum), Y added, S/user/junk ignored
+    assert altpaca.fmt_tokens(1500) == "1.5k" and altpaca.fmt_tokens(2_500_000) == "2.5M"
+
+
+def test_list_shows_and_caches_tokens(env, capsys, monkeypatch):
+    """list surfaces an in+out column (text + JSON) and reuses the stat-keyed cache."""
+    cli = SESSIONS[0][1]  # Alpha's cliSessionId
+    (env.projects / "encoded" / f"{cli}.jsonl").write_text(
+        json.dumps({"type": "assistant", "message": {"id": "m1", "model": "claude-opus-4-8",
+                                                      "usage": {"input_tokens": 100, "output_tokens": 400}}}) + "\n"
+    )
+    altpaca.main(["list", "--json"])
+    data = json.loads(capsys.readouterr().out)
+    alpha = next(s for a in data["accounts"] for s in a["sessions"] if s["title"] == "Alpha")
+    assert alpha["tokens"] == {"input": 100, "output": 400, "total": 500}
+    # a session whose transcript has no usage records reads as zero, not missing
+    other = next(s for a in data["accounts"] for s in a["sessions"] if s["title"] != "Alpha")
+    assert other["tokens"] == {"input": 0, "output": 0, "total": 0}
+    assert altpaca._token_cache_path().exists()  # cache was written
+
+    # second run must NOT re-parse the unchanged transcript
+    calls = []
+    real = altpaca._transcript_messages
+    monkeypatch.setattr(altpaca, "_transcript_messages", lambda p: calls.append(p) or real(p))
+    altpaca.main(["list"])
+    out_text = capsys.readouterr().out
+    assert "in+out" in out_text and "500" in out_text
+    assert calls == []  # every transcript served from cache
+
+
+def _asst(mid, ts, i, o):
+    return {"type": "assistant", "timestamp": ts,
+            "message": {"id": mid, "model": "claude-opus-4-8",
+                        "usage": {"input_tokens": i, "output_tokens": o}}}
+
+
+def test_usage_persists_per_session_after_deletion(env, capsys):
+    """`usage` folds usage into a persistent ledger on every run and reports per
+    day/session, deduping replayed messages — and the data SURVIVES the transcript's
+    deletion (a later run still shows it)."""
+    ts1, ts2 = "2026-01-01T10:00:00.000Z", "2026-01-02T10:00:00.000Z"
+    d1, d2 = altpaca._local_day(ts1), altpaca._local_day(ts2)  # tz-robust: derive expected day
+
+    orphan = env.projects / "encoded" / "deadbeef-0000-0000-0000-000000000000.jsonl"
+    orphan.write_text(
+        "\n".join(json.dumps(x) for x in [
+            _asst("mA", ts1, 100, 200), _asst("mA", ts1, 100, 200), _asst("mB", ts2, 10, 20)])
+        + "\n"
+    )
+    altpaca.main(["usage", "--json"])  # updates the ledger on every run
+    data = json.loads(capsys.readouterr().out)
+    assert data["totals"]["total"] == 330  # 110 in + 220 out, mA deduped
+    assert data["totals"]["in_live_session"] == {"input": 0, "output": 0}  # not backed by a live session
+    assert data["totals"]["orphaned"] == {"input": 110, "output": 220}
+    assert data["sessions"]["with_usage"] == 1
+    days = {d["date"]: d for d in data["days"]}
+    assert days[d1]["input"] == 100 and days[d1]["messages"] == 1 and days[d2]["output"] == 20
+
+    # per-session-per-day CSV artifact (refreshed every run)
+    sess_csv = env.backups.parent / "usage-by-session.csv"
+    assert sess_csv.exists()
+    head, *rows = sess_csv.read_text().splitlines()
+    assert head == "cli_id,uuid,account,project,title,present,date,input,output,messages,total"
+    assert any(r.endswith(f"1,{d1},100,200,1,300") for r in rows)  # present=1, day1 row
+
+    # DELETE the transcript entirely, re-run: the ledger keeps the history
+    orphan.unlink()
+    altpaca.main(["usage", "--json"])
+    data2 = json.loads(capsys.readouterr().out)
+    assert data2["totals"]["total"] == 330  # still recorded though the .jsonl is gone
+    days2 = {d["date"]: d for d in data2["days"]}
+    assert days2[d1]["input"] == 100 and days2[d2]["output"] == 20
+    assert data2["sessions"]["gone"] == 1  # now flagged as transcript-gone, retained
+
+
+def test_ledger_synced_on_every_command(env, capsys):
+    """The persistent ledger is kept current on EVERY altpaca run — not just usage."""
+    ledger = altpaca._usage_ledger_path()
+    assert not ledger.exists()
+
+    orphan = env.projects / "encoded" / "cafe0000-0000-0000-0000-000000000000.jsonl"
+    orphan.write_text(json.dumps(_asst("z1", "2026-01-01T10:00:00.000Z", 7, 9)) + "\n")
+    altpaca.main(["accounts"])  # a NON-usage command still syncs the ledger
+    capsys.readouterr()
+    assert ledger.exists() and "z1" in json.loads(ledger.read_text())["messages"]
+
+    # a newly-active session is folded in on the next run (here: list)
+    live_tx = env.projects / "encoded" / f"{SESSIONS[0][1]}.jsonl"
+    live_tx.write_text(json.dumps(_asst("z2", "2026-01-03T10:00:00.000Z", 1, 2)) + "\n")
+    altpaca.main(["list"])
+    capsys.readouterr()
+    assert "z2" in json.loads(ledger.read_text())["messages"]
+
+
+def test_drop_captures_usage_before_deleting(env, capsys):
+    """Because every run syncs first, a `drop` records a session's usage in the
+    ledger before it removes the session — even if `usage` was never run."""
+    ledger = altpaca._usage_ledger_path()
+    (env.projects / "encoded" / f"{SESSIONS[0][1]}.jsonl").write_text(
+        json.dumps(_asst("z3", "2026-01-05T10:00:00.000Z", 4, 5)) + "\n"
+    )
+    assert not ledger.exists()
+    altpaca.main(["drop", A[:8], "--title", "alpha", "--apply", "--yes"])
+    capsys.readouterr()
+    assert ledger.exists() and "z3" in json.loads(ledger.read_text())["messages"]
+
+
+def test_usage_dedupes_forked_sessions(env, capsys):
+    """A forked/resumed session replays the parent's messages VERBATIM (same message
+    id) into its own transcript. Usage must count each generation ONCE (owned by the
+    older parent), never once per transcript it was copied into."""
+    ts_old, ts_new = "2026-02-01T10:00:00.000Z", "2026-02-02T10:00:00.000Z"
+    # parent transcript: the shared turn, alphabetically/temporally first
+    parent = env.projects / "encoded" / "aaaa1111-0000-0000-0000-000000000000.jsonl"
+    parent.write_text(json.dumps(_asst("shared", ts_old, 100, 200)) + "\n")
+    # fork transcript: replays "shared" (same id) + adds its own new turn
+    fork = env.projects / "encoded" / "bbbb2222-0000-0000-0000-000000000000.jsonl"
+    fork.write_text("\n".join(json.dumps(x) for x in [
+        _asst("shared", ts_old, 100, 200), _asst("forked", ts_new, 5, 9)]) + "\n")
+
+    altpaca.main(["usage", "--json"])
+    data = json.loads(capsys.readouterr().out)
+    # shared (300) counted ONCE + forked (14) = 314, NOT 300 + 300 + 14
+    assert data["totals"]["total"] == 314
+    assert data["sessions"]["with_usage"] == 2  # parent owns "shared", fork owns "forked"
+    d_old = altpaca._local_day(ts_old)
+    days = {d["date"]: d for d in data["days"]}
+    assert days[d_old]["total"] == 300 and days[d_old]["messages"] == 1  # shared booked once
+
+
+def test_failed_save_does_not_advance_sync_state(env, capsys, monkeypatch):
+    """If the ledger save fails (or a run is skipped), the sync-state marker must NOT
+    advance — the next run re-attempts, so un-persisted usage is never marked done."""
+    orphan = env.projects / "encoded" / "beef0000-0000-0000-0000-000000000000.jsonl"
+    orphan.write_text(json.dumps(_asst("m1", "2026-01-01T10:00:00.000Z", 5, 7)) + "\n")
+    state = env.backups.parent / "usage-sync-state"
+
+    fail = {"on": True}
+    real = altpaca.save_usage_ledger
+    monkeypatch.setattr(altpaca, "save_usage_ledger", lambda led: False if fail["on"] else real(led))
+
+    altpaca.main(["accounts"])  # save fails -> nothing persisted
+    capsys.readouterr()
+    assert not state.exists()  # marker NOT advanced
+
+    fail["on"] = False  # save works again
+    altpaca.main(["accounts"])
+    capsys.readouterr()
+    assert state.exists()
+    assert "m1" in json.loads(altpaca._usage_ledger_path().read_text())["messages"]  # re-captured
+
+
+def test_sync_sig_covers_session_metadata(env):
+    """A session-metadata change (e.g. a rename) alters the sync fingerprint, so it's
+    folded in without waiting for the transcript to change."""
+    paths = list(env.projects.glob("*/*.jsonl"))
+    s0 = altpaca._sync_sig(paths)
+    meta_file = env.ccs / A / WA / f"local_{SESSIONS[0][0]}.json"
+    d = json.loads(meta_file.read_text())
+    d["title"] = "Renamed Session"
+    meta_file.write_text(json.dumps(d))
+    assert altpaca._sync_sig(paths) != s0
+
+
+def test_usage_footer_shown_when_no_usage(env, capsys):
+    """Even with zero recorded usage, the run persists and prints the ledger/CSV
+    footer — the footer must not be skipped in the empty case."""
+    altpaca.main(["usage"])  # env transcripts are empty "{}" → no usage
+    assert "ledger updated" in capsys.readouterr().out
+    assert altpaca._usage_ledger_path().exists()
+
+
+def test_cache_prunes_only_deleted_transcripts(env):
+    """A dirty write drops cache keys whose .jsonl is gone, but keeps ones that
+    still exist even when the current call didn't ask about them (list vs usage)."""
+    def usage_line(mid, i, o):
+        return json.dumps({"type": "assistant",
+                           "message": {"id": mid, "model": "claude-opus-4-8",
+                                       "usage": {"input_tokens": i, "output_tokens": o}}}) + "\n"
+
+    live = env.projects / "encoded" / f"{SESSIONS[0][1]}.jsonl"
+    ghost = env.projects / "encoded" / "ghost-0000-0000-0000-000000000000.jsonl"
+    other = env.projects / "encoded" / f"{SESSIONS[1][1]}.jsonl"
+    live.write_text(usage_line("m1", 1, 2))
+    ghost.write_text(usage_line("g1", 5, 6))
+    altpaca.cached_messages([live, ghost, other])  # all three cached
+    cache = json.loads(altpaca._token_cache_path().read_text())
+    assert {str(live), str(ghost), str(other)} <= set(cache)
+
+    ghost.unlink()  # session's transcript deleted
+    live.write_text(live.read_text() + usage_line("m2", 3, 4))  # grow live → dirty write
+    altpaca.cached_messages([live])  # only asks about live
+    cache = json.loads(altpaca._token_cache_path().read_text())
+    assert str(ghost) not in cache  # pruned: file no longer exists
+    assert str(other) in cache  # kept: still exists, though this call didn't ask for it
 
 
 def test_json_preserves_non_ascii(env, capsys):

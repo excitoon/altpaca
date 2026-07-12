@@ -40,6 +40,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import hashlib
 import json
@@ -54,6 +55,11 @@ import uuid as _uuidlib
 import zipfile
 from datetime import datetime
 from pathlib import Path
+
+try:
+    import fcntl  # POSIX advisory locking (macOS/Linux); serializes concurrent ledger writes
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
 
 HOME = Path.home()
 DEFAULT_BASE = HOME / "Library" / "Application Support" / "Claude"
@@ -812,16 +818,82 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def claude_running() -> bool:
-    # the desktop app's main process is "Claude"; also match its executable path
-    # (case-sensitive, so it won't collide with the lowercase claude-code helper).
-    for argv in (["pgrep", "-x", "Claude"], ["pgrep", "-f", "Claude.app/Contents/MacOS/Claude"]):
-        try:
-            if subprocess.run(argv, capture_output=True).returncode == 0:
-                return True
-        except Exception:
-            pass
-    return False
+def _running_claude_desktops() -> list:
+    """Data-dir (tenant base) of every running Claude *desktop* app.
+
+    The desktop main process is launched as
+        /Applications/Claude.app/Contents/MacOS/Claude --user-data-dir=<BASE>
+    and <BASE> is exactly a tenant's base dir. A desktop process started without
+    --user-data-dir falls back to Electron's default, the bare "Claude" base.
+    The match is case-sensitive on ".../MacOS/Claude", so the lowercase claude
+    CLI (.../claude.app/Contents/MacOS/claude) and helper processes are excluded.
+    Returns [] when none run or the process list can't be read.
+    """
+    marker = "Claude.app/Contents/MacOS/Claude"  # capital C: the desktop main only
+    dirs = []
+    try:
+        # -ww: don't truncate to terminal width, so --user-data-dir is never cut off.
+        # errors="replace": `ps -A` dumps EVERY process's argv; a stray non-UTF-8 byte
+        # in some unrelated command line must not raise (that would fail the guard OPEN).
+        out = subprocess.run(
+            ["ps", "-ww", "-Axo", "command="], capture_output=True, text=True, errors="replace"
+        )
+    except Exception:
+        return dirs
+    for line in out.stdout.splitlines():
+        # Match the EXECUTABLE (argv[0]), not any argument that merely contains the
+        # path — otherwise a `grep`/editor touching that path would look like the app.
+        exe = line.strip().split(" ", 1)[0]
+        if not exe.endswith(marker):
+            continue
+        # The value runs to the next " --flag" or the end of the line, so a path
+        # with spaces ("Application Support") survives intact. No flag ⇒ default.
+        m = re.search(r"--user-data-dir=(.+?)(?= --|\s*$)", line)
+        dirs.append(Path(m.group(1)) if m else DEFAULT_BASE)
+    return dirs
+
+
+def _same_dir(a, b) -> bool:
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except Exception:
+        return str(a) == str(b)
+
+
+def claude_running(tenants=None) -> bool:
+    """Is a Claude desktop app running that owns data we're about to touch?
+
+    With no argument, True iff *any* Claude desktop app is running (used for the
+    doctor status line). Given a Tenant or an iterable of them, True only iff a
+    running desktop app is bound to one of those tenants' data dirs — so an
+    unrelated instance on a different --user-data-dir never blocks the write.
+    """
+    running = _running_claude_desktops()
+    if not running:
+        return False
+    if tenants is None:
+        return True
+    if isinstance(tenants, Tenant):
+        tenants = [tenants]
+    bases = [t.base for t in tenants if t is not None]
+    return any(_same_dir(d, b) for d in running for b in bases)
+
+
+def tenants_touching(paths) -> list:
+    """The discovered tenants whose base dir is an ancestor of any given path.
+
+    Used to scope the running-app guard for `restore`, whose backup manifest can
+    span tenants. Returns [] if no path maps to a known tenant (the caller then
+    falls back to the global guard rather than assume the write is safe).
+    """
+    by_base = {os.path.realpath(t.base): t for t in discover_tenants()}
+    hit = {}
+    for p in paths:
+        rp = os.path.realpath(p)
+        for b, t in by_base.items():
+            if rp == b or rp.startswith(b + os.sep):
+                hit[b] = t
+    return list(hit.values())
 
 
 class Progress:
@@ -1056,8 +1128,436 @@ def has_positive_selector(args) -> bool:
 # --------------------------------------------------------------------------- #
 # printing
 # --------------------------------------------------------------------------- #
-def print_session_rows(sessions: list, uuid2group: dict = None):
+# token accounting
+#
+# "Tokens spent" = input + output tokens (cache reads/creation excluded — cheap
+# and dominated by per-turn context re-reads). We parse each transcript down to
+# unique assistant messages, keyed by API message id. Two layers of duplication:
+#   * WITHIN a file the desktop log persists each message several times with the
+#     same usage → deduped here (last copy wins);
+#   * ACROSS files Claude Code replays a message VERBATIM (same id, same usage,
+#     same timestamp) into every resumed/forked/compacted transcript → so any
+#     aggregate over multiple files MUST dedupe by id globally, or it inflates
+#     badly (measured 2.8x on a real store). `usage` does that; per-session `list`
+#     numbers are a single file so they're already correct.
+# The multi-iteration usage shape carries the real numbers inside `iterations`
+# while top-level fields can be 0, so per record we take max(top, sum(iters));
+# `<synthetic>` messages don't count. Each message stores its UTC epoch (not a
+# pre-bucketed local day), so the day split is computed at query time and never
+# goes stale if the machine's timezone changes. Parsing is stat-cached per file
+# (append-only ⇒ unchanged size+mtime ⇒ counts still hold).
+# --------------------------------------------------------------------------- #
+def fmt_tokens(n) -> str:
+    n = int(n or 0)
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1e3:.1f}k"
+    if n < 1_000_000_000:
+        return f"{n / 1e6:.1f}M"
+    return f"{n / 1e9:.2f}B"
+
+
+def _iso_to_epoch(ts):
+    """UTC epoch seconds (int) for an ISO timestamp, or None if absent/unparseable."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+def _day_from_epoch(epoch) -> str:
+    """Local-time calendar day ('YYYY-MM-DD') of a UTC epoch; 'unknown' if none.
+    A human's 'per day' means their own timezone, so convert at query time."""
+    if epoch is None or epoch < 0:
+        return "unknown"
+    try:
+        return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d")
+    except Exception:
+        return "unknown"
+
+
+def _local_day(ts) -> str:
+    """Local calendar day of an ISO timestamp (convenience over the two above)."""
+    return _day_from_epoch(_iso_to_epoch(ts))
+
+
+def _transcript_messages(path) -> dict:
+    """{ message_id: [epoch, input, output] } for one transcript's assistant turns.
+
+    Deduped by id within this file (copies are identical). epoch is UTC seconds,
+    or -1 if the timestamp is missing. Cross-file dedup (resume/fork replays) is
+    the caller's responsibility, since a replayed message keeps its original id.
+    """
+
+    def g(d, k):
+        try:
+            return int(d.get(k) or 0)
+        except Exception:
+            return 0
+
+    msgs = {}
+    try:
+        fh = open(path, errors="replace")  # transcripts can hold stray bytes; never raise
+    except OSError:
+        return msgs
+    with fh:
+        for line in fh:
+            if '"usage"' not in line:  # cheap pre-filter: skip title/mode/user lines
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") != "assistant":
+                continue
+            m = o.get("message") or {}
+            u = m.get("usage")
+            if not isinstance(u, dict) or m.get("model") == "<synthetic>":
+                continue
+            its = u.get("iterations")
+            if isinstance(its, list) and its:
+                inp = max(g(u, "input_tokens"), sum(g(i, "input_tokens") for i in its))
+                out = max(g(u, "output_tokens"), sum(g(i, "output_tokens") for i in its))
+            else:
+                inp, out = g(u, "input_tokens"), g(u, "output_tokens")
+            mid = m.get("id") or o.get("uuid")
+            if not mid:
+                continue  # can't dedupe a message with no stable id; real ones always have one
+            ep = _iso_to_epoch(o.get("timestamp"))
+            msgs[mid] = [ep if ep is not None else -1, inp, out]
+    return msgs
+
+
+def _transcript_cwd(path) -> str:
+    """The working dir recorded in a transcript's lines (for orphaned sessions with
+    no live metadata, this at least recovers the project). '' if not found."""
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if '"cwd"' not in line:
+                    continue
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except Exception:
+                    continue
+                if cwd:
+                    return cwd
+    except OSError:
+        pass
+    return ""
+
+
+def _token_cache_path() -> Path:
+    # colocated with backups (honors ALTPACA_BACKUP_DIR, so tests stay isolated)
+    return backup_root().parent / "token-cache.json"
+
+
+def cached_messages(paths, label="") -> dict:
+    """{ transcript_path_str: {message_id: [epoch, input, output]} } for each path.
+
+    Stat-keyed on-disk cache; only transcripts whose (size, mtime) changed are
+    re-parsed. Shared by `list` (per-session totals) and `usage` (global dedup +
+    per-day report), so a transcript is parsed at most once.
+    """
+    try:
+        cache = json.loads(_token_cache_path().read_text())
+    except Exception:
+        cache = {}
+    todo, out, dirty = [], {}, False
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        key = str(p)
+        sig = [st.st_size, st.st_mtime_ns]
+        ent = cache.get(key)
+        if ent and ent.get("sig") == sig and "msgs" in ent:
+            out[key] = ent["msgs"]
+        else:
+            todo.append((key, p, sig))
+    # only show a progress bar for a non-trivial batch — a 1-2 file refresh (the
+    # common per-run case) shouldn't flash a bar on unrelated commands.
+    prog = Progress(len(todo), label=label) if len(todo) >= 8 else None
+    for i, (key, p, sig) in enumerate(todo, 1):
+        msgs = _transcript_messages(p)
+        out[key] = msgs
+        cache[key] = {"sig": sig, "msgs": msgs}
+        dirty = True
+        if prog:
+            prog.render(i)
+    if prog:
+        prog.finish()
+    if dirty:
+        # Drop entries whose transcript no longer exists (deleted session), so the
+        # cache can't grow forever. Existence-based — NOT "absent from this call" —
+        # so a live-only `list` never evicts the orphan entries `usage` still needs.
+        for k in [k for k in cache if not os.path.exists(k)]:
+            del cache[k]
+        try:
+            cp = _token_cache_path()
+            cp.parent.mkdir(parents=True, exist_ok=True)
+            cp.write_text(json.dumps(cache))
+        except Exception:
+            pass
+    return out
+
+
+def _count_transcript_tokens(path) -> tuple:
+    """(input, output) totals for one transcript (its own messages, in-file deduped)."""
+    msgs = _transcript_messages(path)
+    return (sum(v[1] for v in msgs.values()), sum(v[2] for v in msgs.values()))
+
+
+def compute_session_tokens(sessions: list) -> dict:
+    """uuid -> (input, output) for each session with a transcript (stat-cached).
+
+    Per-session = that one transcript's own tokens (correct in isolation). NOTE:
+    resume/fork chains share replayed messages, so DON'T sum these across sessions
+    to get a grand total — use `usage`, which dedupes by message id globally.
+    """
+    paths = {}  # path str -> [sessions sharing it]
+    for s in sessions:
+        tp = s.transcript()
+        if tp is not None:
+            paths.setdefault(str(tp), []).append(s)
+    permsg = cached_messages([Path(p) for p in paths], label="counting tokens ")
+    out = {}
+    for pstr, shared in paths.items():
+        d = permsg.get(pstr, {})
+        totals = (sum(v[1] for v in d.values()), sum(v[2] for v in d.values()))
+        for s in shared:
+            out[s.uuid] = totals
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# persistent usage ledger
+#
+# The token-cache above is a *cache* — it is pruned when a transcript is deleted,
+# and `usage` recomputes from whatever .jsonl files still exist. The ledger is the
+# opposite: a durable, append-only record of every assistant message ever seen,
+# keyed by message id → [owner_session_cli, utc_epoch, input, output]. It is
+# updated on each `usage` run and NEVER auto-pruned, so a session's per-day usage
+# survives even after its transcript (and its desktop session) disappear. Keying by
+# message id makes it dedupe-correct across resume/fork replays; storing epoch (not
+# a baked local day) keeps the per-day rollup timezone-correct forever.
+# --------------------------------------------------------------------------- #
+def _usage_ledger_path() -> Path:
+    return backup_root().parent / "usage-ledger.json"
+
+
+def load_usage_ledger() -> dict:
+    try:
+        d = json.loads(_usage_ledger_path().read_text())
+        if isinstance(d, dict) and isinstance(d.get("messages"), dict):
+            d.setdefault("sessions", {})
+            return d
+    except Exception:
+        pass
+    return {"version": 1, "messages": {}, "sessions": {}}
+
+
+def save_usage_ledger(ledger) -> bool:
+    try:
+        p = _usage_ledger_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # Write to a PER-CALL unique temp, then atomically replace — so a crash
+        # mid-write can't corrupt the ledger AND two concurrent writers can't
+        # interleave into a shared temp (they'd install garbage). Last replace wins.
+        fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(ledger, fh)
+            os.replace(tmp, p)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return True
+    except Exception as e:
+        warn(f"could not save usage ledger: {e}")
+        return False
+
+
+def merge_scan_into_ledger(ledger, all_paths, permsg, sessions, recover_projects=False):
+    """Fold the current scan into `ledger` IN MEMORY — no disk write. Returns whether
+    anything actually changed (so the caller can skip rewriting an unchanged ledger).
+
+    Each new message is attributed once, to the OLDEST transcript that holds it
+    (so a replay is booked to the session that first produced it), and that owner is
+    fixed forever after. Identities of currently-live sessions are captured so a
+    later deletion keeps the title/project. Nothing is ever removed. `recover_projects`
+    (used only on the persist path) reads an orphan owner's transcript once to fill
+    its project — skipped on reads so a report never touches extra files needlessly.
+    """
+    messages, meta = ledger["messages"], ledger["sessions"]
+    present_paths = {p.stem: p for p in all_paths}
+    present = set(present_paths)
+    dirty = False
+
+    def setfields(e, fields):  # assign only changed fields; report if any changed
+        nonlocal dirty
+        for k, v in fields:
+            if e.get(k) != v:
+                e[k] = v
+                dirty = True
+
+    for s in sessions:  # capture live identity, so a future deletion keeps it
+        if not s.cli_id:
+            continue
+        e = meta.setdefault(s.cli_id, {})
+        setfields(e, [("uuid", s.uuid), ("title", s.title),
+                      ("project", os.path.basename(s.cwd.rstrip("/")) or s.cwd or ""),
+                      ("account", s.account_ref)])
+
+    def earliest(p):
+        d = permsg.get(str(p), {})
+        eps = [v[0] for v in d.values() if v[0] >= 0]
+        return (min(eps) if eps else 1 << 62, str(p))
+
+    for p in sorted(all_paths, key=earliest):  # oldest transcript owns a shared message
+        cli = p.stem
+        for mid, (ep, i, o) in permsg.get(str(p), {}).items():
+            if mid not in messages:
+                messages[mid] = [cli, ep, i, o]
+                dirty = True
+
+    owners = {v[0] for v in messages.values()}  # only sessions with usage get an entry
+    for cli in owners:
+        if cli not in meta:
+            dirty = True
+        e = meta.setdefault(cli, {})
+        if recover_projects and not e.get("title") and not e.get("project") and cli in present_paths:
+            cwd = _transcript_cwd(present_paths[cli])
+            if cwd:
+                setfields(e, [("project", os.path.basename(cwd.rstrip("/")) or cwd)])
+        setfields(e, [("present", cli in present)])
+    return dirty
+
+
+def update_usage_ledger(all_paths, permsg, sessions) -> bool:
+    """Persist the current scan: load, merge, and SAVE the ledger — but only rewrite
+    the file when the merge actually changed something. Serialized by an advisory
+    lock so two concurrent altpaca runs can't clobber each other.
+
+    Returns True iff the on-disk ledger now reflects this scan (so the caller may
+    advance its sync-state marker). Returns False if we skipped on lock contention
+    or the save failed — the marker must NOT advance then, or a genuinely-needed
+    re-sync would be skipped and usage could be lost before a `drop`.
+    """
+    lockf = None
+    if fcntl is not None:
+        try:
+            lockf = open(str(_usage_ledger_path()) + ".lock", "w")
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if lockf is not None:
+                lockf.close()
+            return False  # another run holds the lock; we did NOT persist this scan
+    try:
+        ledger = load_usage_ledger()
+        if merge_scan_into_ledger(ledger, all_paths, permsg, sessions, recover_projects=True):
+            return save_usage_ledger(ledger)  # True only if the write actually succeeded
+        return True  # nothing changed — the ledger already reflects this scan
+    finally:
+        if lockf is not None:
+            try:
+                fcntl.flock(lockf, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lockf.close()
+
+
+def _sync_state_path() -> Path:
+    return backup_root().parent / "usage-sync-state"
+
+
+def _sync_sig(transcript_paths) -> str:
+    """A cheap fingerprint of everything a sync reads — the transcript files AND the
+    session-metadata files (local_*.json), by (path, size, mtime). If it's unchanged
+    since the last sync, a re-sync would produce an identical ledger, so it can be
+    skipped entirely — no ledger/cache load, no re-parse — keeping every command fast.
+    Covering metadata too means a session rename/move is folded in without waiting for
+    the transcript to change."""
+    paths = [str(x) for x in transcript_paths]
+    for t in discover_tenants():
+        paths += glob.glob(str(t.sessions_root / "*" / "*" / "local_*.json"))
+    h = hashlib.sha256()
+    for p in sorted(paths):
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        h.update(f"{p}\0{st.st_size}\0{st.st_mtime_ns}\0".encode())
+    return h.hexdigest()
+
+
+def sync_usage_ledger():
+    """Fold the current transcripts into the persistent ledger. Run once per altpaca
+    invocation (from main), so the ledger stays current no matter which command runs
+    — a session's usage is captured before it can ever disappear. Best-effort and
+    silent: a sync failure (or an unconfigured environment) never breaks the command.
+
+    Fast-path: if no transcript changed since the last sync, skip everything.
+    """
+    try:
+        all_paths = [Path(p) for p in glob.glob(str(projects_dir() / "*" / "*.jsonl"))]
+        if not all_paths:
+            return
+        sig = _sync_sig(all_paths)
+        state = _sync_state_path()
+        try:
+            # skip only if nothing changed AND the ledger is actually there (a deleted
+            # ledger with a surviving sidecar must NOT fast-path into reporting empty)
+            if state.read_text() == sig and _usage_ledger_path().exists():
+                return
+        except Exception:
+            pass
+        sessions = discover() if any(t.sessions_root.exists() for t in discover_tenants()) else []
+        # Advance the sync-state marker ONLY when the scan was actually persisted —
+        # never after a lock-contention skip or a failed save, or the fast-path would
+        # later skip re-capturing these transcripts (and a drop could lose them).
+        if update_usage_ledger(all_paths, cached_messages(all_paths, label="syncing usage ledger "), sessions):
+            try:
+                state.parent.mkdir(parents=True, exist_ok=True)
+                state.write_text(sig)
+            except Exception:
+                pass
+    except (Exception, SystemExit):  # incl. discover() die() on an unconfigured env — never abort the command
+        pass
+
+
+def ledger_rollups(ledger) -> tuple:
+    """(per_session, per_day) from a ledger.
+
+    per_session: cli -> {day: [input, output, messages]}
+    per_day:            {day: [input, output, messages]}
+    Days are derived from each message's epoch at call time (timezone-correct).
+    """
+    per_session, per_day = {}, {}
+    for cli, ep, i, o in ledger["messages"].values():
+        day = _day_from_epoch(ep if ep is not None and ep >= 0 else None)
+        d = per_session.setdefault(cli, {}).setdefault(day, [0, 0, 0])
+        d[0] += i
+        d[1] += o
+        d[2] += 1
+        g = per_day.setdefault(day, [0, 0, 0])
+        g[0] += i
+        g[1] += o
+        g[2] += 1
+    return per_session, per_day
+
+
+def print_session_rows(sessions: list, uuid2group: dict = None, tokens: dict = None):
     show_group = uuid2group is not None
+    show_tok = tokens is not None
     for s in sorted(sessions, key=lambda x: x.last_activity, reverse=True):
         base = os.path.basename(s.cwd.rstrip("/")) or s.cwd or "?"
         flag = "A" if s.archived else " "
@@ -1068,6 +1568,9 @@ def print_session_rows(sessions: list, uuid2group: dict = None):
         cells = [f"{s.uuid[:8]:8}", f"{fmt_ts(s.created):16}", f"{fmt_ts(s.last_activity):16}", flag]
         if show_group:
             cells.append(f"{(uuid2group.get(s.uuid) or '')[:12]:12}")
+        if show_tok:
+            io = tokens.get(s.uuid)
+            cells.append(f"{(fmt_tokens(io[0] + io[1]) if io else '-'):>8}")
         cells.append(f"{base[:18]:18}")
         cells.append(title)
         print("  " + "  ".join(cells) + miss)
@@ -1085,9 +1588,17 @@ def emit_json(obj):
     print(json.dumps(obj, indent=2, ensure_ascii=False))
 
 
-def _session_dict(s: Session, group=None) -> dict:
-    """A session as JSON-serializable fields (timestamps are epoch-ms ints)."""
-    return {
+_NO_TOKENS = object()  # sentinel: caller didn't ask for a tokens field (vs. asked, got None)
+
+
+def _session_dict(s: Session, group=None, tokens=_NO_TOKENS) -> dict:
+    """A session as JSON-serializable fields (timestamps are epoch-ms ints).
+
+    `tokens`, when supplied, is an (input, output) pair (or None for a session
+    with no transcript); it adds a "tokens" object. Omit it and no such key
+    appears, so callers that don't count tokens are unaffected.
+    """
+    d = {
         "uuid": s.uuid,
         "session_id": s.session_id,
         "cli_id": s.cli_id,
@@ -1102,6 +1613,11 @@ def _session_dict(s: Session, group=None) -> dict:
         "group": group,
         "has_transcript": s.transcript() is not None,
     }
+    if tokens is not _NO_TOKENS:
+        d["tokens"] = (
+            {"input": tokens[0], "output": tokens[1], "total": tokens[0] + tokens[1]} if tokens else None
+        )
+    return d
 
 
 def cmd_accounts(args):
@@ -1179,6 +1695,12 @@ def cmd_list(args):
         uuid2group, _names = native_groups(acc.tenant)
         blocks.append((acc, ss, uuid2group))
 
+    # input+output tokens per session (stat-cached; only changed transcripts recount).
+    # These are per-transcript; resume/fork chains share replayed messages, so we do
+    # NOT sum them into an account/grand total here — `altpaca usage` does that with a
+    # global message-id dedup. Summing the column would double-count shared history.
+    tok = compute_session_tokens([s for _, ss, _ in blocks for s in ss])
+
     if getattr(args, "json", False):
         emit_json(
             {
@@ -1188,7 +1710,7 @@ def cmd_list(args):
                         "tenant": acc.tenant.name,
                         "uuid": acc.uuid,
                         "sessions": [
-                            _session_dict(s, uuid2group.get(s.uuid))
+                            _session_dict(s, uuid2group.get(s.uuid), tokens=tok.get(s.uuid))
                             for s in sorted(ss, key=lambda x: x.last_activity, reverse=True)
                         ],
                     }
@@ -1212,13 +1734,15 @@ def cmd_list(args):
         hdr = [f"{'uuid':8}", f"{'first activity':16}", f"{'last activity':16}", " "]
         if show_group:
             hdr.append(f"{'group':12}")
+        hdr.append(f"{'in+out':>8}")
         hdr.append(f"{'project':18}")
         hdr.append("title")
         print("  " + "  ".join(hdr))
-        print_session_rows(ss, uuid2group=uuid2group if show_group else None)
+        print_session_rows(ss, uuid2group=uuid2group if show_group else None, tokens=tok)
         total += len(ss)
     if not args.account and len(accounts) > 1:
         print(f"\ntotal: {total} session(s) across {len(accounts)} account(s)")
+    print("(in+out is per-session; for a deduplicated grand total & per-day usage: altpaca usage)")
 
 
 def _slug(text: str, n: int = 40) -> str:
@@ -1440,10 +1964,11 @@ def regroup(src_tenant, dst_tenant, candidates, *, apply, force, no_backup, yes,
         )
         return 0
 
-    if claude_running() and not force:
+    if claude_running(dst_tenant) and not force:
         return stop(
-            "the Claude desktop app is running — quit it first (it owns this Local Storage and can "
-            "clobber the write), then retry. use --force to override."
+            f"the Claude desktop app for tenant '{dst_tenant.name or 'default'}' is running — quit that "
+            "instance first (it owns this Local Storage and can clobber the write), then retry. use "
+            "--force to override."
         )
 
     if not yes:
@@ -1452,8 +1977,11 @@ def regroup(src_tenant, dst_tenant, candidates, *, apply, force, no_backup, yes,
         prompt = f"\nProceed to regroup {len(plan)} session(s) in {dst_tenant.name or 'default'}? [y/N] "
         if input(prompt).strip().lower() not in ("y", "yes"):
             die("aborted")
-        if claude_running() and not force:  # re-check: the app may have started during the prompt
-            die("the Claude desktop app started while waiting — quit it and retry (it can clobber the write).")
+        if claude_running(dst_tenant) and not force:  # re-check: the app may have started during the prompt
+            die(
+                f"the Claude desktop app for tenant '{dst_tenant.name or 'default'}' started while waiting "
+                "— quit it and retry (it can clobber the write)."
+            )
 
     active_log, man_seq = _ldb_active_log(dst_ls)
     if active_log is None:
@@ -1597,10 +2125,15 @@ def transfer(args, remove_source: bool):
         print(f"\nDRY-RUN — nothing changed. Re-run with --apply to {verb}. (add --yes to skip the prompt)")
         return
 
-    if claude_running() and not args.force:
+    # Only the tenants this op writes to matter: the destination always, plus the
+    # source when a move removes files from it. An unrelated instance on another
+    # data dir is irrelevant and must not block the write.
+    watch = [dst.tenant] + ([src.tenant] if remove_source else [])
+    if claude_running(watch) and not args.force:
+        names = " / ".join(sorted({t.name or "default" for t in watch if claude_running(t)}))
         die(
-            "the Claude desktop app is running — quit it first (it can overwrite changes on exit), "
-            "then retry. use --force to override."
+            f"the Claude desktop app for tenant '{names}' is running — quit that instance first "
+            "(it can overwrite changes on exit), then retry. use --force to override."
         )
 
     if not args.yes:
@@ -1721,10 +2254,10 @@ def cmd_drop(args):
         print("\nDRY-RUN — nothing changed. Re-run with --apply to delete. (add --yes to skip the prompt)")
         return
 
-    if claude_running() and not args.force:
+    if claude_running(acc.tenant) and not args.force:
         die(
-            "the Claude desktop app is running — quit it first (it can overwrite changes on exit), "
-            "then retry. use --force to override."
+            f"the Claude desktop app for tenant '{acc.tenant.name or 'default'}' is running — quit that "
+            "instance first (it can overwrite changes on exit), then retry. use --force to override."
         )
 
     if not args.yes:
@@ -1785,14 +2318,17 @@ def cmd_restore(args):
         if not args.apply:
             print("DRY-RUN — nothing changed. Re-run with --apply.")
             return
-        if claude_running() and not args.force:
-            die("quit the Claude desktop app first, then retry (or use --force).")
+        # Scope the guard to the tenants the manifest actually writes into; if no
+        # path maps to a known tenant, fall back to the global guard (None).
+        watch = tenants_touching(created + [Path(o["path"]) for o in originals]) or None
+        if claude_running(watch) and not args.force:
+            die("quit the Claude desktop app for the affected tenant first, then retry (or use --force).")
         if not args.yes:
             if not sys.stdin.isatty():
                 die("refusing to apply without confirmation; pass --yes")
             if input("Proceed to restore? [y/N] ").strip().lower() not in ("y", "yes"):
                 die("aborted")
-            if claude_running() and not args.force:  # re-check after the prompt (it owns Local Storage)
+            if claude_running(watch) and not args.force:  # re-check after the prompt (it owns Local Storage)
                 die("the Claude desktop app started while waiting — quit it and retry.")
 
         for p in created:
@@ -1814,7 +2350,12 @@ def cmd_doctor(args):
                 "base_dir": str(base_dir()),
                 "base_exists": base_dir().exists(),
                 "tenants": [
-                    {"name": t.name, "base": str(t.base), "sessions_root_exists": t.sessions_root.exists()}
+                    {
+                        "name": t.name,
+                        "base": str(t.base),
+                        "sessions_root_exists": t.sessions_root.exists(),
+                        "app_running": claude_running(t),
+                    }
                     for t in tenants
                 ],
                 "projects_dir": str(projects_dir()),
@@ -1830,11 +2371,12 @@ def cmd_doctor(args):
     print(f"tenants          : {len(tenants)}")
     for t in tenants:
         sr = t.sessions_root
-        print(f"  {t.name or '(default)':12}  {t.base}  (sessions-root {'ok' if sr.exists() else 'MISSING'})")
+        run = "  [app running — blocks writes to THIS tenant]" if claude_running(t) else ""
+        print(f"  {t.name or '(default)':12}  {t.base}  (sessions-root {'ok' if sr.exists() else 'MISSING'}){run}")
     pj = projects_dir()
     print(f"projects dir     : {pj}  ({'ok' if pj.exists() else 'MISSING'})")
     print(f"backup root      : {backup_root()}")
-    print(f"Claude running   : {'yes (quit before moving)' if claude_running() else 'no'}")
+    print(f"Claude running   : {'yes (only quit the tenant you write to)' if claude_running() else 'no'}")
     print(f"env session id   : {os.environ.get('CLAUDE_CODE_SESSION_ID', '(unset)')}")
     print(f"accounts         : {len(accts)}")
     for a in accts:
@@ -1899,6 +2441,167 @@ def cmd_groups(args):
         print("no app groups found (could not read Local Storage, or none defined).")
 
 
+def cmd_usage(args):
+    """Report input+output token usage per day and per session, keeping a PERSISTENT
+    ledger current so a session's history survives even after its transcript (and
+    desktop session) are deleted.
+
+    Every run scans every transcript in the projects dir — live and orphaned — folds
+    any new messages into ~/.altpaca/usage-ledger.json (deduped by message id, never
+    pruned) and refreshes the CSV artifacts, then reports. `--by-session` prints a
+    per-session breakdown. `drop` also snapshots into the ledger before it deletes.
+    """
+    proj = projects_dir()
+    all_paths = [Path(p) for p in glob.glob(str(proj / "*" / "*.jsonl"))]
+    live_cli = set()
+    live_sessions = []
+    if any(t.sessions_root.exists() for t in discover_tenants()):
+        live_sessions = discover()
+        live_cli = {s.cli_id for s in live_sessions if s.cli_id}
+
+    permsg = cached_messages(all_paths, label="scanning transcripts ")
+    # main() already synced the ledger for this run; just read it back and report.
+    ledger = load_usage_ledger()
+    per_session, per_day = ledger_rollups(ledger)
+    meta = ledger["sessions"]
+    messages = ledger["messages"]
+
+    # "still live" = usage present in a transcript that a live session still owns;
+    # everything else (orphaned transcript, or transcript purged) is "deleted".
+    live_ids = set()
+    for p in all_paths:
+        if p.stem in live_cli:
+            live_ids.update(permsg.get(str(p), {}))
+    tin = tout = live_in = live_out = 0
+    for mid, (cli, ep, i, o) in messages.items():
+        tin += i
+        tout += o
+        if mid in live_ids:
+            live_in += i
+            live_out += o
+    del_in, del_out = tin - live_in, tout - live_out
+
+    n_present = sum(1 for c in per_session if meta.get(c, {}).get("present"))
+    n_gone = len(per_session) - n_present
+    order = sorted(per_day, key=lambda day: (day == "unknown", day))
+
+    def sess_row(cli):  # (uuid, account, project, title, present) with fallbacks
+        m = meta.get(cli, {})
+        return (m.get("uuid", ""), m.get("account", ""), m.get("project", ""), m.get("title", ""), bool(m.get("present")))
+
+    _write_usage_csvs(order, per_day, per_session, meta, sess_row)  # refreshed every run
+
+    if getattr(args, "json", False):
+        emit_json(
+            {
+                "ledger": str(_usage_ledger_path()),
+                "sessions": {"with_usage": len(per_session), "transcript_on_disk": n_present, "gone": n_gone},
+                "totals": {
+                    "input": tin,
+                    "output": tout,
+                    "total": tin + tout,
+                    "in_live_session": {"input": live_in, "output": live_out},
+                    "orphaned": {"input": del_in, "output": del_out},
+                },
+                "days": [
+                    {
+                        "date": day,
+                        "sessions": sum(1 for c in per_session if day in per_session[c]),
+                        "messages": per_day[day][2],
+                        "input": per_day[day][0],
+                        "output": per_day[day][1],
+                        "total": per_day[day][0] + per_day[day][1],
+                    }
+                    for day in order
+                ],
+            }
+        )
+        return
+
+    if args.by_session:
+        rows = sorted(
+            per_session.items(),
+            key=lambda kv: sum(d[0] + d[1] for d in kv[1].values()),
+            reverse=True,
+        )
+        print(f"{len(per_session)} session(s) with usage  ({n_present} on disk, {n_gone} gone — retained in ledger)")
+        print(f"\n  {'in+out':>8}  {'days':>4}  {'account':8}  {'project':14}  title")
+        for cli, days in rows:
+            tot = sum(d[0] + d[1] for d in days.values())
+            uuid, acct, project, title, present = sess_row(cli)
+            tag = "" if present else "  [transcript gone]"
+            label = title or f"(cli {cli[:8]})"
+            print(f"  {fmt_tokens(tot):>8}  {len(days):>4}  {(acct or '?')[:8]:8}  {project[:14]:14}  {label[:40]}{tag}")
+        _print_usage_footer(args)
+        return
+
+    print(
+        f"sessions with usage: {len(per_session)}  "
+        f"({n_present} transcript on disk, {n_gone} gone — retained in ledger)   [deduped by message id]"
+    )
+    print(
+        f"tokens: {fmt_tokens(tin)} in + {fmt_tokens(tout)} out = {fmt_tokens(tin + tout)} total"
+        f"   [in a live session {fmt_tokens(live_in + live_out)}, "
+        f"in orphaned/deleted {fmt_tokens(del_in + del_out)}]"
+    )
+    if not order:
+        print("\nno assistant token usage recorded yet.")
+        _print_usage_footer(args)
+        return
+    print()
+    print(f"  {'date':10}  {'sess':>5}  {'msgs':>6}  {'in':>8}  {'out':>8}  {'total':>9}")
+    for day in order:
+        a = per_day[day]
+        nsess = sum(1 for c in per_session if day in per_session[c])
+        print(
+            f"  {day:10}  {nsess:>5}  {fmt_tokens(a[2]):>6}  "
+            f"{fmt_tokens(a[0]):>8}  {fmt_tokens(a[1]):>8}  {fmt_tokens(a[0] + a[1]):>9}"
+        )
+    tmsg = sum(a[2] for a in per_day.values())
+    print(
+        f"  {'TOTAL':10}  {len(per_session):>5}  {fmt_tokens(tmsg):>6}  "
+        f"{fmt_tokens(tin):>8}  {fmt_tokens(tout):>8}  {fmt_tokens(tin + tout):>9}"
+    )
+    print(f"  (TOTAL sess = {len(per_session)} distinct sessions; a session spans multiple days)")
+    _print_usage_footer(args)
+
+
+def _print_usage_footer(args):
+    base = backup_root().parent
+    print(f"\nsaved per-day CSV     : {base / 'usage-daily.csv'}")
+    print(f"saved per-session CSV : {base / 'usage-by-session.csv'}   (per session × day, includes deleted)")
+    print(f"ledger updated        : {_usage_ledger_path()}   (persists even after a session is deleted)")
+
+
+def _write_usage_csvs(order, per_day, per_session, meta, sess_row):
+    """Write usage-daily.csv (per day) and usage-by-session.csv (per session × day)."""
+    base = backup_root().parent
+    daily_csv = base / "usage-daily.csv"
+    sess_csv = base / "usage-by-session.csv"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        with open(daily_csv, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["date", "sessions", "messages", "input", "output", "total"])
+            for day in order:
+                a = per_day[day]
+                nsess = sum(1 for c in per_session if day in per_session[c])
+                w.writerow([day, nsess, a[2], a[0], a[1], a[0] + a[1]])
+        with open(sess_csv, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["cli_id", "uuid", "account", "project", "title", "present", "date",
+                        "input", "output", "messages", "total"])
+            for cli in sorted(per_session):
+                uuid, acct, project, title, present = sess_row(cli)
+                for day in sorted(per_session[cli], key=lambda d: (d == "unknown", d)):
+                    a = per_session[cli][day]
+                    w.writerow([cli, uuid, acct, project, title, int(present), day,
+                                a[0], a[1], a[2], a[0] + a[1]])
+    except Exception as e:
+        warn(f"could not write usage CSVs: {e}")
+    return daily_csv, sess_csv
+
+
 # --------------------------------------------------------------------------- #
 # cli
 # --------------------------------------------------------------------------- #
@@ -1931,6 +2634,16 @@ def build_parser():
     add_selectors(sp)
     add_json(sp)
     sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser(
+        "usage",
+        help="per-day & per-session token usage; updates a persistent ledger that survives session deletion",
+    )
+    sp.add_argument(
+        "--by-session", action="store_true", help="show a per-session breakdown instead of the per-day table"
+    )
+    add_json(sp)
+    sp.set_defaults(func=cmd_usage)
 
     sp = sub.add_parser("dump", help="archive a whole account's sessions into one .zip (metadata + transcripts)")
     sp.add_argument("account", help="account ref '<uuid>' or '<tenant>/<uuid>' (prefix ok) — whole account archived")
@@ -2003,6 +2716,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    sync_usage_ledger()  # keep the persistent usage ledger current on every run
     return args.func(args)
 
 
