@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -63,6 +64,7 @@ except ImportError:  # pragma: no cover - non-POSIX
 
 HOME = Path.home()
 DEFAULT_BASE = HOME / "Library" / "Application Support" / "Claude"
+DEFAULT_APP = Path("/Applications/Claude.app")  # desktop bundle to launch; override via ALTPACA_CLAUDE_APP
 SESSIONS_DIRNAME = "claude-code-sessions"
 
 
@@ -818,6 +820,17 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+#   /Applications/Claude.app/Contents/MacOS/Claude          (capital-C desktop main)
+#   /Applications/Claude Alt.app/Contents/MacOS/Claude       (spaces in the bundle name)
+#   /Applications/Claude Alt.app/Contents/MacOS/Claude.real  (README's wrapper renames the
+#                                                             real binary to Claude.real)
+# It must NOT match the lowercase `claude` CLI (.../claude.app/Contents/MacOS/claude) or
+# helper processes (.../Contents/Helpers/..., .../Frameworks/...). Case-sensitive "Claude"
+# excludes the CLI; requiring the exe path to END in this pattern (before any flag) excludes
+# a `grep`/editor arg that merely mentions the path.
+_DESKTOP_MAIN_RE = re.compile(r"/Claude[^/]*\.app/Contents/MacOS/Claude(?:\.real)?$")
+
+
 def _running_claude_desktops() -> list:
     """Data-dir (tenant base) of every running Claude *desktop* app.
 
@@ -825,11 +838,12 @@ def _running_claude_desktops() -> list:
         /Applications/Claude.app/Contents/MacOS/Claude --user-data-dir=<BASE>
     and <BASE> is exactly a tenant's base dir. A desktop process started without
     --user-data-dir falls back to Electron's default, the bare "Claude" base.
-    The match is case-sensitive on ".../MacOS/Claude", so the lowercase claude
-    CLI (.../claude.app/Contents/MacOS/claude) and helper processes are excluded.
-    Returns [] when none run or the process list can't be read.
+    We can't recover argv[0] by splitting on the first space — the README's own
+    alt-bundle recipe uses paths with spaces ("Claude Alt.app") and a renamed
+    "Claude.real" binary — so we match _DESKTOP_MAIN_RE against the executable
+    portion (everything before the first " --" flag). Returns [] when none run or
+    the process list can't be read.
     """
-    marker = "Claude.app/Contents/MacOS/Claude"  # capital C: the desktop main only
     dirs = []
     try:
         # -ww: don't truncate to terminal width, so --user-data-dir is never cut off.
@@ -841,10 +855,12 @@ def _running_claude_desktops() -> list:
     except Exception:
         return dirs
     for line in out.stdout.splitlines():
-        # Match the EXECUTABLE (argv[0]), not any argument that merely contains the
-        # path — otherwise a `grep`/editor touching that path would look like the app.
-        exe = line.strip().split(" ", 1)[0]
-        if not exe.endswith(marker):
+        # The executable is everything before the first " --" flag; the desktop app is
+        # launched as "<exe>" or "<exe> --user-data-dir=...", so <exe> ends the head.
+        # Anchoring the pattern to the END of the head keeps an argument that merely
+        # mentions the path (a `grep`, an absolute-path arg) from looking like the app.
+        head = line.split(" --", 1)[0].rstrip()
+        if not _DESKTOP_MAIN_RE.search(head):
             continue
         # The value runs to the next " --flag" or the end of the line, so a path
         # with spaces ("Application Support") survives intact. No flag ⇒ default.
@@ -894,6 +910,65 @@ def tenants_touching(paths) -> list:
             if rp == b or rp.startswith(b + os.sep):
                 hit[b] = t
     return list(hit.values())
+
+
+# --------------------------------------------------------------------------- #
+# launching the desktop app for an account (`run`)
+#
+# altpaca addresses an account by its *tenant's* data dir, and the desktop app
+# opens a given profile via Electron's --user-data-dir=<BASE>. So "run Claude
+# for an account" is just launching the app bound to that account's tenant base
+# — the very command the README spells out by hand, minus the footgun: it
+# refuses to start a SECOND instance on a data dir that already has one running,
+# which the app punishes with LevelDB LOCK errors.
+# --------------------------------------------------------------------------- #
+def claude_app_binary(override: str = None) -> Path:
+    """The desktop main executable to launch.
+
+    `override` (the --app flag) wins, else $ALTPACA_CLAUDE_APP, else the default
+    bundle. A value pointing at a ".app" bundle is resolved to its inner
+    Contents/MacOS/Claude; a value already pointing at a binary is used as-is.
+    """
+    raw = override or os.environ.get("ALTPACA_CLAUDE_APP") or str(DEFAULT_APP)
+    p = Path(raw).expanduser()
+    if p.suffix == ".app" or (p / "Contents" / "MacOS").is_dir():
+        return p / "Contents" / "MacOS" / "Claude"
+    return p
+
+
+def _launch_detached(argv: list) -> None:
+    """Spawn a GUI app fully detached from this process and the terminal."""
+    subprocess.Popen(
+        [str(a) for a in argv],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _launch_identity(acc: Account):
+    """(email-suffix, caveat-or-None) for `run`'s messaging.
+
+    `run` launches a *tenant's* profile, and the desktop app opens whichever account
+    that tenant is signed into — which need not be the requested partition (a tenant
+    can hold several `claude-code-sessions/<uuid>` folders). So we never *assert* the
+    app will show `acc`: we annotate the account's own email when known, and if the
+    tenant's known login is a DIFFERENT account, we say so. Best-effort: any read
+    failure yields ('', None) and never blocks the launch.
+    """
+    try:
+        emails, current = account_identities()
+    except Exception:
+        return "", None
+    ident = emails.get(acc.uuid)
+    who = f"  ({ident[0]})" if ident else ""
+    tenant_logins = {u for (b, u) in current if b == str(acc.tenant.base)}
+    if tenant_logins and acc.uuid not in tenant_logins:
+        others = ", ".join(sorted((emails.get(u) or (u[:8],))[0] for u in tenant_logins))
+        caveat = f"note: this tenant is signed into {others}; the app opens that account, not {acc.ref}"
+        return who, caveat
+    return who, None
 
 
 class Progress:
@@ -2341,6 +2416,50 @@ def cmd_restore(args):
     print("restored. restart the Claude desktop app to see the result.")
 
 
+def cmd_run(args):
+    acc = resolve_account(args.account)
+    base = acc.tenant.base
+    binary = claude_app_binary(getattr(args, "app", None))
+    argv = [str(binary), f"--user-data-dir={base}"]
+
+    if args.dry_run:
+        who, caveat = _launch_identity(acc)
+        print(f"account : {acc.ref}{who}")
+        print(f"tenant  : {acc.tenant.name or '(default)'}")
+        print(f"data dir: {base}")
+        if caveat:
+            print(caveat)
+        print("would run:")
+        print("  " + " ".join(shlex.quote(a) for a in argv))
+        return
+
+    if not (binary.is_file() and os.access(binary, os.X_OK)):
+        die(
+            f"Claude desktop app not found or not executable at {binary}\n"
+            "point --app (or $ALTPACA_CLAUDE_APP) at your Claude.app bundle."
+        )
+    # Won't fight the app: a second instance on the SAME data dir dies on a
+    # LevelDB LOCK, so refuse if this tenant already has one running.
+    if claude_running(acc.tenant) and not args.force:
+        die(
+            f"a Claude desktop app is already running on {base}\n"
+            "a second instance on the same data dir fails with LevelDB LOCK errors —\n"
+            "quit it first, or pass --force to launch anyway."
+        )
+
+    try:
+        _launch_detached(argv)
+    except OSError as e:
+        die(f"could not launch {binary}: {e}")
+    # The identity read scans IndexedDB — do it AFTER spawning so a big store never
+    # delays the app; it is cosmetic (which account/email) and never fatal.
+    who, caveat = _launch_identity(acc)
+    print(f"launched Claude for {acc.ref}{who}")
+    print(f"  data dir: {base}")
+    if caveat:
+        print(caveat)
+
+
 def cmd_doctor(args):
     tenants = discover_tenants()
     accts = all_account_objs()
@@ -2654,6 +2773,19 @@ def build_parser():
     sp = sub.add_parser("groups", help="list the app's custom groups and their members (read-only)")
     add_json(sp)
     sp.set_defaults(func=cmd_groups)
+
+    sp = sub.add_parser("run", help="launch the Claude desktop app for an account (its tenant's data dir)")
+    sp.add_argument("account", help="account ref '<uuid>' or '<tenant>/<uuid>' (prefix ok)")
+    sp.add_argument(
+        "--app",
+        metavar="PATH",
+        help="Claude.app bundle or binary to launch (default /Applications/Claude.app; or set ALTPACA_CLAUDE_APP)",
+    )
+    sp.add_argument("-n", "--dry-run", action="store_true", help="print the launch command instead of running it")
+    sp.add_argument(
+        "--force", action="store_true", help="launch even if a desktop app is already running on this data dir"
+    )
+    sp.set_defaults(func=cmd_run)
 
     for name, helptext, remove in (
         ("move", "move sessions to another account (removes from source)", True),

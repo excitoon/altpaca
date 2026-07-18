@@ -87,6 +87,11 @@ altpaca groups                                      # list the app's groups + me
 altpaca list --group Home                       # filter (group shown as a column)
 altpaca move aaaaaaaa bbbbbbbb --group Travel       # move a whole group at once
 
+# launch the desktop app FOR an account — opens its tenant's isolated profile
+altpaca run aaaaaaaa                                 # start Claude bound to that account's data dir
+altpaca run excitoon/9cc54b3d                        # a named tenant's account
+altpaca run aaaaaaaa -n                              # dry-run: print the exact launch command
+
 # tenants — a sibling "Claude-<suffix>" app-data dir is a second tenant (see below)
 altpaca list excitoon/9cc54b3d                      # address a named tenant's account
 altpaca move excitoon/9cc54b3d aaaaaaaa --all       # cross-tenant move — group membership carried automatically
@@ -135,6 +140,12 @@ launched by path:
 Each `--user-data-dir` is an independent profile — separate web login (kept in the
 profile, not shared), separate `claude-code-sessions/`, no shared state — and the
 two run concurrently.
+
+`altpaca run <account>` does exactly this for you: it resolves the account to its
+tenant's data dir and launches the desktop app with the matching `--user-data-dir`.
+It refuses to start a **second** instance on a data dir that already has one running
+(that fails with `LevelDB … LOCK`) — pass `--force` to override, or `-n` to just print
+the command. Point it at a non-standard bundle with `--app` or `ALTPACA_CLAUDE_APP`.
 
 > ⚠️ One profile dir = one running instance. Pointing a second launch at a dir
 > that is already open fails with `LevelDB … LOCK` errors; use a *different*
@@ -257,6 +268,7 @@ Quit the app before regrouping, and **restart it afterward** to see the result.
 ## Environment
 
 - `ALTPACA_CLAUDE_DIR` — Claude app-support dir (default `~/Library/Application Support/Claude`).
+- `ALTPACA_CLAUDE_APP` — Claude desktop bundle/binary `altpaca run` launches (default `/Applications/Claude.app`).
 - `CLAUDE_CONFIG_DIR` — if set, transcripts are read from `$CLAUDE_CONFIG_DIR/projects` (matches Claude Code).
 - `ALTPACA_PROJECTS_DIR` — override the transcripts dir directly (wins over the above).
 - `ALTPACA_BACKUP_DIR` — where backups are written (default `~/.altpaca/backups`).

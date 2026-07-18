@@ -1224,3 +1224,235 @@ def test_move_auto_regroup_best_effort_when_no_dst_store(env, capsys):
     moved = alt / "claude-code-sessions" / B / WB / "local_11111111-1111-1111-1111-111111111111.json"
     assert moved.exists()  # the move itself completed
     assert "group membership not carried" in capsys.readouterr().err  # best-effort warning, not a failure
+
+
+# --------------------------------------------------------------------------- #
+# run: launch the desktop app for an account, bound to its tenant's data dir.
+# --------------------------------------------------------------------------- #
+def _fake_app(tmp_path):
+    """A stand-in Claude.app bundle whose inner binary actually exists on disk."""
+    binary = tmp_path / "Claude.app" / "Contents" / "MacOS" / "Claude"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    return tmp_path / "Claude.app", binary
+
+
+def test_app_binary_resolves_bundle_and_binary(tmp_path):
+    _bundle, binary = _fake_app(tmp_path)
+    assert altpaca.claude_app_binary(str(tmp_path / "Claude.app")) == binary  # .app -> inner main
+    assert altpaca.claude_app_binary(str(binary)) == binary  # already a binary -> as-is
+
+
+def test_run_dry_run_prints_command_without_launching(env, capsys, monkeypatch, tmp_path):
+    bundle, binary = _fake_app(tmp_path)
+    launched = []
+    monkeypatch.setattr(altpaca, "_launch_detached", lambda argv: launched.append(argv))
+    altpaca.main(["run", A[:8], "--app", str(bundle), "-n"])
+    out = capsys.readouterr().out
+    assert f"--user-data-dir={env.base}" in out  # the account's tenant data dir
+    assert str(binary) in out  # bundle resolved to its inner binary
+    assert A in out  # account ref echoed
+    assert launched == []  # dry-run never spawns
+
+
+def test_run_launches_detached_with_tenant_data_dir(env, monkeypatch, tmp_path, capsys):
+    bundle, binary = _fake_app(tmp_path)
+    calls = []
+    monkeypatch.setattr(altpaca, "_launch_detached", lambda argv: calls.append(list(argv)))
+    altpaca.main(["run", A[:8], "--app", str(bundle)])
+    assert calls == [[str(binary), f"--user-data-dir={env.base}"]]
+    out = capsys.readouterr().out
+    assert "launched Claude" in out
+    assert f"data dir: {env.base}" in out
+
+
+def test_run_refuses_when_app_already_running(env, monkeypatch, tmp_path):
+    bundle, _binary = _fake_app(tmp_path)
+    monkeypatch.setattr(altpaca, "claude_running", lambda *a, **k: True)
+    launched = []
+    monkeypatch.setattr(altpaca, "_launch_detached", lambda argv: launched.append(argv))
+    with pytest.raises(SystemExit):
+        altpaca.main(["run", A[:8], "--app", str(bundle)])
+    assert launched == []  # never starts a second instance on a locked data dir
+
+
+def test_run_force_launches_despite_running(env, monkeypatch, tmp_path):
+    bundle, binary = _fake_app(tmp_path)
+    monkeypatch.setattr(altpaca, "claude_running", lambda *a, **k: True)
+    calls = []
+    monkeypatch.setattr(altpaca, "_launch_detached", lambda argv: calls.append(list(argv)))
+    altpaca.main(["run", A[:8], "--app", str(bundle), "--force"])
+    assert calls == [[str(binary), f"--user-data-dir={env.base}"]]
+
+
+def test_run_app_not_found_dies(env, capsys, tmp_path):
+    with pytest.raises(SystemExit):
+        altpaca.main(["run", A[:8], "--app", str(tmp_path / "nope.app")])  # bundle doesn't exist
+    err = capsys.readouterr().err
+    assert "not found or not executable" in err and "--app" in err  # the actionable message, not any exit
+
+
+def test_run_app_not_found_wins_over_running_guard(env, monkeypatch, tmp_path):
+    """A missing binary is reported even when an app is running: the exists-check
+    precedes the running-guard, so the user gets the fixable error, not 'already running'."""
+    monkeypatch.setattr(altpaca, "claude_running", lambda *a, **k: True)
+    with pytest.raises(SystemExit):
+        altpaca.main(["run", A[:8], "--app", str(tmp_path / "nope.app")])
+
+
+def test_run_non_executable_app_dies_cleanly(env, tmp_path):
+    """A resolved binary that exists but isn't executable dies via die(), not a raw
+    PermissionError traceback."""
+    binary = tmp_path / "Claude.app" / "Contents" / "MacOS" / "Claude"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("not executable")
+    binary.chmod(0o644)  # readable, NOT +x
+    with pytest.raises(SystemExit):
+        altpaca.main(["run", A[:8], "--app", str(tmp_path / "Claude.app")])
+
+
+def test_run_launch_oserror_dies_cleanly(env, monkeypatch, tmp_path):
+    """If Popen itself fails, run surfaces die() rather than propagating OSError."""
+    bundle, _binary = _fake_app(tmp_path)
+
+    def boom(argv):
+        raise OSError("nope")
+
+    monkeypatch.setattr(altpaca, "_launch_detached", boom)
+    with pytest.raises(SystemExit):
+        altpaca.main(["run", A[:8], "--app", str(bundle)])
+
+
+def test_run_dry_run_works_without_installed_app(env, capsys, monkeypatch, tmp_path):
+    """`-n` previews the command even when the app isn't installed (dry-run precedes
+    the exists-check) and never spawns anything."""
+    launched = []
+    monkeypatch.setattr(altpaca, "_launch_detached", lambda argv: launched.append(argv))
+    altpaca.main(["run", A[:8], "--app", str(tmp_path / "nope.app"), "-n"])  # must NOT raise
+    out = capsys.readouterr().out
+    assert "would run" in out
+    assert str(tmp_path / "nope.app" / "Contents" / "MacOS" / "Claude") in out  # unresolved path echoed
+    assert launched == []
+
+
+def test_run_named_tenant_launches_sibling_data_dir(env, monkeypatch, tmp_path):
+    alt = env.base.parent / "Claude-excitoon"
+    (alt / "claude-code-sessions" / B / WB).mkdir(parents=True)
+    bundle, binary = _fake_app(tmp_path)
+    calls = []
+    monkeypatch.setattr(altpaca, "_launch_detached", lambda argv: calls.append(list(argv)))
+    altpaca.main(["run", f"excitoon/{B[:8]}", "--app", str(bundle)])
+    assert calls == [[str(binary), f"--user-data-dir={alt}"]]  # the sibling tenant's base, not the default
+
+
+def test_run_guard_is_scoped_to_the_accounts_tenant(env, monkeypatch, tmp_path):
+    """cmd_run must consult the guard with the ACCOUNT'S tenant, not the global
+    claude_running() — otherwise an app on an unrelated tenant would block the launch.
+    (The real guard's per-tenant scoping is covered by test_running_guard_ignores_...)"""
+    alt = env.base.parent / "Claude-excitoon"
+    (alt / "claude-code-sessions" / B / WB).mkdir(parents=True)
+    bundle, _binary = _fake_app(tmp_path)
+    seen = []
+
+    def guard(tenant=None):
+        seen.append(tenant)
+        return True
+
+    monkeypatch.setattr(altpaca, "claude_running", guard)
+    with pytest.raises(SystemExit):
+        altpaca.main(["run", f"excitoon/{B[:8]}", "--app", str(bundle)])
+    assert len(seen) == 1  # a global claude_running() regression would pass tenant=None
+    assert isinstance(seen[0], altpaca.Tenant) and str(seen[0].base) == str(alt)
+
+
+def test_run_shows_signed_in_email(env, capsys, monkeypatch, tmp_path):
+    """The (email) annotation surfaces when the account's login is known."""
+    _write_idb_account(env.base, A, "alice@example.com", "Alice")
+    bundle, _binary = _fake_app(tmp_path)
+    monkeypatch.setattr(altpaca, "_launch_detached", lambda argv: None)
+    altpaca.main(["run", A[:8], "--app", str(bundle)])
+    assert "alice@example.com" in capsys.readouterr().out
+
+
+def test_run_warns_when_tenant_signed_into_other_account(env, capsys, tmp_path):
+    """Requesting a partition the tenant is NOT signed into: run says the app will open
+    the signed-in account instead of asserting the requested one."""
+    # the default tenant's IndexedDB names B (bob) as its login, but we ask for A
+    _write_idb_account(env.base, B, "bob@example.com", "Bob")
+    bundle, _binary = _fake_app(tmp_path)
+    altpaca.main(["run", A[:8], "--app", str(bundle), "-n"])
+    out = capsys.readouterr().out
+    assert "signed into bob@example.com" in out
+    assert A in out  # still identifies which partition was requested
+
+
+def test_run_survives_identity_scan_failure(env, capsys, monkeypatch, tmp_path):
+    """account_identities blowing up must not stop the launch (best-effort annotation)."""
+    bundle, binary = _fake_app(tmp_path)
+
+    def boom():
+        raise RuntimeError("idb exploded")
+
+    monkeypatch.setattr(altpaca, "account_identities", boom)
+    calls = []
+    monkeypatch.setattr(altpaca, "_launch_detached", lambda argv: calls.append(list(argv)))
+    altpaca.main(["run", A[:8], "--app", str(bundle)])
+    assert calls == [[str(binary), f"--user-data-dir={env.base}"]]
+    assert "launched Claude" in capsys.readouterr().out
+
+
+def test_app_binary_env_override_and_precedence(env, monkeypatch, tmp_path):
+    bundle, binary = _fake_app(tmp_path)
+    monkeypatch.setenv("ALTPACA_CLAUDE_APP", str(bundle))
+    assert altpaca.claude_app_binary() == binary  # env used when no override
+    # an explicit override beats the env var
+    other = tmp_path / "Other.app" / "Contents" / "MacOS" / "Claude"
+    other.parent.mkdir(parents=True)
+    assert altpaca.claude_app_binary(str(tmp_path / "Other.app")) == other
+
+
+def test_app_binary_bundle_dir_without_app_suffix(tmp_path):
+    """A directory shaped like a bundle but not ending in .app still resolves to its main."""
+    d = tmp_path / "ClaudeBundle"
+    (d / "Contents" / "MacOS").mkdir(parents=True)
+    assert altpaca.claude_app_binary(str(d)) == d / "Contents" / "MacOS" / "Claude"
+
+
+def test_launch_detached_uses_detached_devnull_popen(monkeypatch):
+    """_launch_detached must fully detach: new session + all three streams to DEVNULL."""
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            captured["argv"] = argv
+            captured["kw"] = kw
+
+    monkeypatch.setattr(altpaca.subprocess, "Popen", FakePopen)
+    altpaca._launch_detached(["/x/Claude", "--user-data-dir=/y"])
+    assert captured["argv"] == ["/x/Claude", "--user-data-dir=/y"]
+    kw = captured["kw"]
+    assert kw["start_new_session"] is True
+    assert kw["stdin"] == kw["stdout"] == kw["stderr"] == altpaca.subprocess.DEVNULL
+
+
+def test_running_desktops_matches_spaced_and_wrapper_bundles(monkeypatch):
+    """The running-app guard sees the README's alt setups: a bundle name with a space
+    ('Claude Alt.app') and the renamed 'Claude.real' wrapper binary — while still
+    ignoring the lowercase CLI and an absolute-path arg that merely mentions the marker."""
+    AS = "/tmp/ASrun"
+    lines = [
+        f"/Applications/Claude Alt.app/Contents/MacOS/Claude --user-data-dir={AS}/Claude-alt",
+        f"/Applications/Claude Beta.app/Contents/MacOS/Claude.real --user-data-dir={AS}/Claude-beta --enable-logging",
+        # excluded: lowercase CLI
+        f"{AS}/x/claude.app/Contents/MacOS/claude --user-data-dir={AS}/nope",
+        # excluded: an absolute-path ARGUMENT mentioning the marker (no flags on the line)
+        "grep -r /Users/x/Claude.app/Contents/MacOS/Claude /life",
+    ]
+    monkeypatch.setattr(
+        altpaca.subprocess,
+        "run",
+        lambda argv, **kw: argparse.Namespace(stdout="\n".join(lines), returncode=0),
+    )
+    dirs = [str(d) for d in altpaca._running_claude_desktops()]
+    assert dirs == [f"{AS}/Claude-alt", f"{AS}/Claude-beta"]
